@@ -2733,6 +2733,7 @@ class Ns(object):
 
         """
 
+        task_id_list = []
         for change in changes_list:
             task = Ns._create_task(
                 deployment_info=change["deployment_info"],
@@ -2743,6 +2744,15 @@ class Ns(object):
                 target_record_id=change["target_record_id"],
                 extra_dict=change.get("extra_dict", None),
             )
+            if task.get("item") == "vdu" and task.get("params", {}).get(
+                "affinity_group_list"
+            ):
+                task_id_list.append(task["task_id"])
+                target_record_data = task["target_record"].split(":")
+                vdur_index = target_record_data[2].split(".")[1]
+                if vdur_index != "0":
+                    self.insert_task_id(task_id_list, task)
+                    del task_id_list[0]
 
             self.logger.debug("ns.define_all_tasks task={}".format(task))
             tasks_by_target_record_id[change["target_record_id"]] = task
@@ -2750,6 +2760,15 @@ class Ns(object):
 
             if change.get("common_id"):
                 task["common_id"] = change["common_id"]
+
+    def insert_task_id(self, task_id_list, task):
+        for index, value in enumerate(task_id_list):
+            if index != 0:
+                task_id = task_id_list[index - 1]
+                vdur_text = "{}".format(task_id)
+                task.get("depends_on").append(vdur_text)
+                break
+        return task
 
     def upload_all_tasks(
         self,
