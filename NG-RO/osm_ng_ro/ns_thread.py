@@ -1248,6 +1248,28 @@ class VimInteractionFlavor(VimInteractionBase):
 
             if task.get("find_params", {}).get("vim_flavor_id"):
                 vim_flavor_id = task["find_params"]["vim_flavor_id"]
+                db_nsr = self.db.get_one("nsrs", {"_id": task["nsr_id"]})
+                for vnfr_id in db_nsr.get("constituent-vnfr-ref"):
+                    db_vnfr = self.db.get_one("vnfrs", {"_id": vnfr_id})
+                    for each_flavor in db_nsr["flavor"]:
+                        nsd_flavor_id = each_flavor["id"]
+                        for vdur in db_vnfr["vdur"]:
+                            if (
+                                vdur.get("ns-flavor-id")
+                                and vdur.get("ns-flavor-id") == nsd_flavor_id
+                            ):
+                                if vdur["additionalParams"]["OSM"].get("vim_flavor_id"):
+                                    flavor_id = vdur["additionalParams"]["OSM"][
+                                        "vim_flavor_id"
+                                    ]
+                                    flavor_details = target_vim.get_flavor(flavor_id)
+                                    flavor_dict = {
+                                        "memory-mb": flavor_details["ram"],
+                                        "storage-gb": flavor_details["disk"],
+                                        "vcpu-count": flavor_details["vcpus"],
+                                    }
+                                    each_flavor.update(flavor_dict)
+                self.db.set_one("nsrs", {"_id": task["nsr_id"]}, db_nsr)
             elif task.get("find_params", {}).get("flavor_data"):
                 try:
                     flavor_data = task["find_params"]["flavor_data"]
