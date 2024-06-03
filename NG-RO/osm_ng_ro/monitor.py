@@ -875,8 +875,16 @@ class MonitorVms:
                     self.prepare_vims_to_monitor(vims_to_monitor, ro_task, target_vim)
 
             for vim in vims_to_monitor:
-                all_servers, all_ports = self.my_vims[vim.vim_id].get_monitoring_data()
-                self.update_vnfrs(all_servers, all_ports, vim.vms)
+                try:
+                    all_servers, all_ports = self.my_vims[
+                        vim.vim_id
+                    ].get_monitoring_data()
+                    self.update_vnfrs(all_servers, all_ports, vim.vms)
+                except (DbException, MonitorDbException) as e:
+                    raise MonitorVmsException(str(e))
+                except Exception as e:
+                    self.logger.info("Exception in vim monitoring {}".format(e))
+                    continue
         except (
             DbException,
             MonitorDbException,
@@ -891,6 +899,8 @@ class MonitorVms:
             raise MonitorVmsException(
                 f"Exception while monitoring Openstack VMs: {str(e)}"
             )
+        except Exception as e:
+            self.logger.info("Exception in monitoring {}".format(e))
 
 
 def start_monitoring(config: dict):
