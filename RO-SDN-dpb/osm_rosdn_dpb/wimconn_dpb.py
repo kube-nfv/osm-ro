@@ -108,7 +108,10 @@ class DpbSshInterface:
 
     def __create_client(self):
         ssh_client = paramiko.SSHClient()
-        ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        # Load known host keys
+        ssh_client.load_system_host_keys()
+        # Reject unknown hosts
+        ssh_client.set_missing_host_key_policy(paramiko.RejectPolicy())
 
         return ssh_client
 
@@ -132,6 +135,11 @@ class DpbSshInterface:
                 look_for_keys=False,
                 compress=False,
             )
+            # TODO: sanitizing commands to be executed
+            # Whitelist of allowed commands
+            # valid_commands = ["command1", "command2", "command3"]
+            # if self.__network not in valid_commands:
+            #     raise SdnConnectorError("Invalid command executed", 400)
             stdin, stdout, stderr = self.__ssh_client.exec_command(
                 command=self.__network
             )
