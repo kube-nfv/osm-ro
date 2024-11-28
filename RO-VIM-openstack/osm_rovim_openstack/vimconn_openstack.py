@@ -637,7 +637,7 @@ class vimconnector(vimconn.VimConnector):
                 type(exception).__name__ + ": " + message_error
             )
 
-    def _get_ids_from_name(self):
+    def _get_ids_from_name(self, security_group_name=None):
         """
          Obtain ids from name of tenant and security_groups. Store at self .security_groups_id"
         :return: None
@@ -652,11 +652,15 @@ class vimconnector(vimconn.VimConnector):
                 )
             )
 
+        neutron_sg_list = self.neutron.list_security_groups(
+            tenant_id=self.my_tenant_id
+        )["security_groups"]
+
         if self.config.get("security_groups") and not self.security_groups_id:
             # convert from name to id
-            neutron_sg_list = self.neutron.list_security_groups(
-                tenant_id=self.my_tenant_id
-            )["security_groups"]
+            # neutron_sg_list = self.neutron.list_security_groups(
+            #     tenant_id=self.my_tenant_id
+            # )["security_groups"]
 
             self.security_groups_id = []
             for sg in self.config.get("security_groups"):
@@ -670,6 +674,18 @@ class vimconnector(vimconn.VimConnector):
                     raise vimconn.VimConnConnectionException(
                         "Not found security group {} for this tenant".format(sg)
                     )
+
+        if security_group_name is not None:
+            self.security_groups_id = []
+            for neutron_sg in neutron_sg_list:
+                if security_group_name in (neutron_sg["id"], neutron_sg["name"]):
+                    self.security_groups_id.append(neutron_sg["id"])
+                    break
+            else:
+                self.security_groups_id = None
+                raise vimconn.VimConnConnectionException(
+                    "Not found security group {} for this tenant".format(sg)
+                )
 
     def _find_nova_server(self, vm_id):
         """
@@ -1933,7 +1949,9 @@ class vimconnector(vimconn.VimConnector):
                 "No enough availability zones at VIM for this deployment"
             )
 
-    def _prepare_port_dict_security_groups(self, net: dict, port_dict: dict) -> None:
+    def _prepare_port_dict_security_groups(
+        self, net: dict, port_dict: dict, security_group_name=None
+    ) -> None:
         """Fill up the security_groups in the port_dict.
 
         Args:
@@ -1950,6 +1968,10 @@ class vimconnector(vimconn.VimConnector):
                 self._get_ids_from_name()
 
             port_dict["security_groups"] = self.security_groups_id
+
+            if security_group_name is not None:
+                self._get_ids_from_name(security_group_name)
+                port_dict["security_groups"] = self.security_groups_id
 
     def _prepare_port_dict_binding(self, net: dict, port_dict: dict) -> None:
         """Fill up the network binding depending on network type in the port_dict.
@@ -2038,7 +2060,7 @@ class vimconnector(vimconn.VimConnector):
         return new_port
 
     def _create_port(
-        self, net: dict, name: str, created_items: dict
+        self, net: dict, name: str, created_items: dict, security_group_name=None
     ) -> Tuple[dict, dict]:
         """Create port using net details.
 
@@ -2061,7 +2083,7 @@ class vimconnector(vimconn.VimConnector):
         if not port_dict["name"]:
             port_dict["name"] = name
 
-        self._prepare_port_dict_security_groups(net, port_dict)
+        self._prepare_port_dict_security_groups(net, port_dict, security_group_name)
 
         self._prepare_port_dict_binding(net, port_dict)
 
@@ -2086,6 +2108,7 @@ class vimconnector(vimconn.VimConnector):
         net_list_vim: list,
         external_network: list,
         no_secured_ports: list,
+        security_group_name=None,
     ) -> None:
         """Create port and fill up net dictionary for new VM instance creation.
 
@@ -2105,7 +2128,9 @@ class vimconnector(vimconn.VimConnector):
             if not net.get("net_id"):
                 continue
 
-            new_port, port = self._create_port(net, name, created_items)
+            new_port, port = self._create_port(
+                net, name, created_items, security_group_name
+            )
 
             net_list_vim.append(port)
 
@@ -2760,6 +2785,7 @@ class vimconnector(vimconn.VimConnector):
         disk_list=None,
         availability_zone_index=None,
         availability_zone_list=None,
+        security_group_name=None,
     ) -> tuple:
         """Adds a VM instance to VIM.
 
@@ -2842,6 +2868,7 @@ class vimconnector(vimconn.VimConnector):
                 net_list_vim=net_list_vim,
                 external_network=external_network,
                 no_secured_ports=no_secured_ports,
+                security_group_name=security_group_name,
             )
 
             # Cloud config

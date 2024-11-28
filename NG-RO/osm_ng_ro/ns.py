@@ -1834,12 +1834,19 @@ class Ns(object):
             target_vdu["vdu-name"],
             target_vdu.get("count-index") or 0,
         )
+        security_group_name = None
         if additional_params := target_vdu.get("additionalParams"):
             if additional_params.get("OSM", {}).get("instance_name"):
                 instance_name = additional_params.get("OSM", {}).get("instance_name")
                 if count_index := target_vdu.get("count-index"):
                     if count_index >= 1:
                         instance_name = "{}-{}".format(instance_name, count_index)
+            if additional_params.get("OSM", {}).get("security-group-name"):
+                security_group_name = additional_params.get("OSM", {}).get(
+                    "security-group-name"
+                )
+            else:
+                security_group_name = None
 
         extra_dict["params"] = {
             "name": instance_name,
@@ -1851,6 +1858,7 @@ class Ns(object):
             "net_list": net_list,
             "cloud_config": cloud_config or None,
             "disk_list": disk_list,
+            "security_group_name": security_group_name,
             "availability_zone_index": None,  # TODO
             "availability_zone_list": None,  # TODO
         }
@@ -2081,6 +2089,12 @@ class Ns(object):
                 if count_index := existing_vdu.get("count-index"):
                     if count_index >= 1:
                         instance_name = "{}-{}".format(instance_name, count_index)
+            if additional_params.get("OSM", {}).get("security-group-name"):
+                security_group_name = additional_params.get("OSM", {}).get(
+                    "security-group-name"
+                )
+            else:
+                security_group_name = None
 
         extra_dict["params"] = {
             "name": instance_name,
@@ -2092,6 +2106,7 @@ class Ns(object):
             "net_list": net_list,
             "cloud_config": cloud_config or None,
             "disk_list": disk_list,
+            "security_group_name": security_group_name,
             "availability_zone_index": None,  # TODO
             "availability_zone_list": None,  # TODO
         }

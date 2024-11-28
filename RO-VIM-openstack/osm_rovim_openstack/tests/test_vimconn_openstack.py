@@ -60,6 +60,7 @@ disk_list2 = [
 ]
 availability_zone_index = 0
 availability_zone_list = ["nova"]
+security_group_name = None
 floating_network_vim_id = "108b73-e9cc-5a6a-t270-82cc4811bd4a"
 net_id = "83372685-f67f-49fd-8722-eabb7692fc22"
 net2_id = "46472685-f67f-49fd-8722-eabb7692fc22"
@@ -521,6 +522,7 @@ class TestNewVmInstance(unittest.TestCase):
             "name": "management",
             "admin_state_up": True,
         }
+        security_group_name = None
 
         new_port_result, port_result = self.vimconn._create_port(
             net, name, created_items
@@ -529,7 +531,9 @@ class TestNewVmInstance(unittest.TestCase):
         self.assertDictEqual(new_port_result, new_port)
         self.assertDictEqual(port_result, expected_port)
 
-        mock_prepare_port_dict_security_groups.assert_called_once_with(net, port_dict)
+        mock_prepare_port_dict_security_groups.assert_called_once_with(
+            net, port_dict, security_group_name
+        )
         mock_prepare_port_dict_binding.assert_called_once_with(net, port_dict)
         mock_prepare_port_dict_mac_ip_addr.assert_called_once_with(net, port_dict)
         mock_create_new_port.assert_called_once_with(port_dict, created_items, net)
@@ -572,6 +576,7 @@ class TestNewVmInstance(unittest.TestCase):
             "admin_state_up": True,
             "name": name,
         }
+        security_group_name = None
 
         new_port_result, port_result = self.vimconn._create_port(
             net, name, created_items
@@ -580,7 +585,9 @@ class TestNewVmInstance(unittest.TestCase):
         self.assertDictEqual(new_port_result, new_port)
         self.assertDictEqual(port_result, expected_port)
 
-        mock_prepare_port_dict_security_groups.assert_called_once_with(net, port_dict)
+        mock_prepare_port_dict_security_groups.assert_called_once_with(
+            net, port_dict, security_group_name
+        )
         mock_prepare_port_dict_binding.assert_called_once_with(net, port_dict)
         mock_prepare_port_dict_mac_ip_addr.assert_called_once_with(net, port_dict)
         mock_create_new_port.assert_called_once_with(port_dict, created_items, net)
@@ -623,6 +630,7 @@ class TestNewVmInstance(unittest.TestCase):
             "admin_state_up": True,
             "name": name,
         }
+        security_group_name = None
 
         new_port_result, port_result = self.vimconn._create_port(
             net, name, created_items
@@ -631,7 +639,9 @@ class TestNewVmInstance(unittest.TestCase):
         self.assertDictEqual(new_port_result, new_port)
         self.assertDictEqual(port_result, expected_port)
 
-        mock_prepare_port_dict_security_groups.assert_called_once_with(net, port_dict)
+        mock_prepare_port_dict_security_groups.assert_called_once_with(
+            net, port_dict, security_group_name
+        )
         mock_prepare_port_dict_binding.assert_called_once_with(net, port_dict)
         mock_prepare_port_dict_mac_ip_addr.assert_called_once_with(net, port_dict)
         mock_create_new_port.assert_called_once_with(port_dict, created_items, net)
@@ -662,11 +672,14 @@ class TestNewVmInstance(unittest.TestCase):
             "admin_state_up": True,
             "name": name,
         }
+        security_group_name = None
 
         with self.assertRaises(Exception):
             self.vimconn._create_port(net, name, created_items)
 
-        mock_prepare_port_dict_security_groups.assert_called_once_with(net, port_dict)
+        mock_prepare_port_dict_security_groups.assert_called_once_with(
+            net, port_dict, security_group_name
+        )
         mock_prepare_port_dict_binding.assert_called_once_with(net, port_dict)
         mock_prepare_port_dict_mac_ip_addr.assert_called_once_with(net, port_dict)
         mock_create_new_port.assert_called_once_with(port_dict, created_items, net)
@@ -697,11 +710,14 @@ class TestNewVmInstance(unittest.TestCase):
             "admin_state_up": True,
             "name": name,
         }
+        security_group_name = None
 
         with self.assertRaises(Exception):
             self.vimconn._create_port(net, name, created_items)
 
-        mock_prepare_port_dict_security_groups.assert_called_once_with(net, port_dict)
+        mock_prepare_port_dict_security_groups.assert_called_once_with(
+            net, port_dict, security_group_name
+        )
 
         mock_prepare_port_dict_binding.assert_not_called()
         mock_prepare_port_dict_mac_ip_addr.assert_not_called()
@@ -734,11 +750,14 @@ class TestNewVmInstance(unittest.TestCase):
             "admin_state_up": True,
             "name": name,
         }
+        security_group_name = None
 
         with self.assertRaises(Exception):
             self.vimconn._create_port(net, name, created_items)
 
-        mock_prepare_port_dict_security_groups.assert_called_once_with(net, port_dict)
+        mock_prepare_port_dict_security_groups.assert_called_once_with(
+            net, port_dict, security_group_name
+        )
 
         mock_prepare_port_dict_binding.assert_called_once_with(net, port_dict)
 
@@ -771,11 +790,14 @@ class TestNewVmInstance(unittest.TestCase):
             "admin_state_up": True,
             "name": name,
         }
+        security_group_name = None
 
         with self.assertRaises(Exception):
             self.vimconn._create_port(net, name, created_items)
 
-        mock_prepare_port_dict_security_groups.assert_called_once_with(net, port_dict)
+        mock_prepare_port_dict_security_groups.assert_called_once_with(
+            net, port_dict, security_group_name
+        )
         mock_prepare_port_dict_binding.assert_called_once_with(net, port_dict)
         mock_prepare_port_dict_mac_ip_addr.assert_called_once_with(net, port_dict)
 
@@ -817,12 +839,15 @@ class TestNewVmInstance(unittest.TestCase):
                 "fixed_ips": [{"ip_address": ip_addr1}],
             },
         }
+        security_group_name = None
         mock_create_new_port.return_value = new_port
 
         with self.assertRaises(VimConnException):
             self.vimconn._create_port(net, name, created_items)
 
-        mock_prepare_port_dict_security_groups.assert_called_once_with(net, port_dict)
+        mock_prepare_port_dict_security_groups.assert_called_once_with(
+            net, port_dict, security_group_name
+        )
         mock_prepare_port_dict_binding.assert_called_once_with(net, port_dict)
         mock_prepare_port_dict_mac_ip_addr.assert_called_once_with(net, port_dict)
         mock_create_new_port.assert_called_once_with(port_dict, created_items, net)
@@ -938,6 +963,7 @@ class TestNewVmInstance(unittest.TestCase):
         self.assertEqual(external_network, expected_external_network)
         self.assertEqual(expected_no_secured_ports, no_secured_ports)
 
+        security_group_name = None
         mock_create_port.assert_called_once_with(
             {
                 "net_id": net2_id,
@@ -946,6 +972,7 @@ class TestNewVmInstance(unittest.TestCase):
             },
             name,
             created_items,
+            security_group_name,
         )
 
     @patch.object(vimconnector, "_reload_connection")
@@ -1001,6 +1028,7 @@ class TestNewVmInstance(unittest.TestCase):
         self.assertEqual(external_network, expected_external_network)
         self.assertEqual(expected_no_secured_ports, no_secured_ports)
 
+        security_group_name = None
         mock_create_port.assert_called_once_with(
             {
                 "net_id": net2_id,
@@ -1009,6 +1037,7 @@ class TestNewVmInstance(unittest.TestCase):
             },
             name,
             created_items,
+            security_group_name,
         )
 
     @patch.object(vimconnector, "_reload_connection")
@@ -1067,6 +1096,7 @@ class TestNewVmInstance(unittest.TestCase):
                 no_secured_ports,
             )
 
+        security_group_name = None
         mock_create_port.assert_called_once_with(
             {
                 "net_id": net2_id,
@@ -1077,6 +1107,7 @@ class TestNewVmInstance(unittest.TestCase):
             },
             name,
             created_items,
+            security_group_name,
         )
         self.assertEqual(expected_net_list_vim, net_list_vim)
         self.assertEqual(external_network, expected_external_network)
@@ -1128,6 +1159,7 @@ class TestNewVmInstance(unittest.TestCase):
                 no_secured_ports,
             )
 
+        security_group_name = None
         mock_create_port.assert_called_once_with(
             {
                 "net_id": net2_id,
@@ -1137,6 +1169,7 @@ class TestNewVmInstance(unittest.TestCase):
             },
             name,
             created_items,
+            security_group_name,
         )
         self.assertEqual(expected_net_list_vim, net_list_vim)
         self.assertEqual(external_network, expected_external_network)
@@ -1188,6 +1221,7 @@ class TestNewVmInstance(unittest.TestCase):
                 no_secured_ports,
             )
 
+        security_group_name = None
         mock_create_port.assert_called_once_with(
             {
                 "net_id": net2_id,
@@ -1197,6 +1231,7 @@ class TestNewVmInstance(unittest.TestCase):
             },
             name,
             created_items,
+            security_group_name,
         )
         self.assertEqual(expected_net_list_vim, net_list_vim)
         self.assertEqual(external_network, expected_external_network)
@@ -1240,6 +1275,7 @@ class TestNewVmInstance(unittest.TestCase):
 
         self.assertEqual(type(err.exception), KeyError)
 
+        security_group_name = None
         mock_create_port.assert_called_once_with(
             {
                 "net_id": net2_id,
@@ -1249,6 +1285,7 @@ class TestNewVmInstance(unittest.TestCase):
             },
             name,
             created_items,
+            security_group_name,
         )
         self.assertEqual(expected_net_list_vim, net_list_vim)
         self.assertEqual(external_network, expected_external_network)
@@ -3285,6 +3322,7 @@ class TestNewVmInstance(unittest.TestCase):
             disk_list2,
             availability_zone_index,
             availability_zone_list,
+            security_group_name,
         )
         self.assertEqual(result, expected_result)
 
@@ -3296,6 +3334,7 @@ class TestNewVmInstance(unittest.TestCase):
             net_list_vim=[],
             external_network=[],
             no_secured_ports=[],
+            security_group_name=security_group_name,
         )
         mock_create_user_data.assert_called_once_with(cloud_config)
         mock_get_vm_availability_zone.assert_called_once_with(
@@ -3385,6 +3424,7 @@ class TestNewVmInstance(unittest.TestCase):
             disk_list,
             availability_zone_index,
             availability_zone_list,
+            security_group_name,
         )
 
         mock_reload_connection.assert_called_once()
@@ -3395,6 +3435,7 @@ class TestNewVmInstance(unittest.TestCase):
             net_list_vim=[],
             external_network=[],
             no_secured_ports=[],
+            security_group_name=security_group_name,
         )
         mock_create_user_data.assert_called_once_with(cloud_config)
         mock_get_vm_availability_zone.assert_not_called()
@@ -3473,6 +3514,7 @@ class TestNewVmInstance(unittest.TestCase):
             net_list_vim=[],
             external_network=[],
             no_secured_ports=[],
+            security_group_name=security_group_name,
         )
         mock_create_user_data.assert_called_once_with(cloud_config)
         mock_get_vm_availability_zone.assert_called_once_with(
@@ -3560,6 +3602,7 @@ class TestNewVmInstance(unittest.TestCase):
             disk_list2,
             availability_zone_index,
             availability_zone_list,
+            security_group_name,
         )
         self.assertEqual(result, expected_result)
 
@@ -3571,6 +3614,7 @@ class TestNewVmInstance(unittest.TestCase):
             net_list_vim=[],
             external_network=[],
             no_secured_ports=[],
+            security_group_name=security_group_name,
         )
         mock_create_user_data.assert_called_once_with(cloud_config)
         mock_get_vm_availability_zone.assert_called_once_with(
@@ -3660,6 +3704,7 @@ class TestNewVmInstance(unittest.TestCase):
             disk_list2,
             availability_zone_index,
             availability_zone_list,
+            security_group_name,
         )
 
         mock_reload_connection.assert_called_once()
@@ -3670,6 +3715,7 @@ class TestNewVmInstance(unittest.TestCase):
             net_list_vim=[],
             external_network=[],
             no_secured_ports=[],
+            security_group_name=security_group_name,
         )
         mock_create_user_data.assert_called_once_with(cloud_config)
         mock_get_vm_availability_zone.assert_called_once_with(
