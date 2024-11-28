@@ -521,7 +521,7 @@ class VimConnector:
         """
         raise VimConnNotImplemented("Should have implemented this")
 
-    def get_flavor(self, flavor_id):
+    def get_flavor(self, flavor_id, flavor_name):
         """Obtain flavor details from the VIM
         Returns the flavor dict details {'id':<>, 'name':<>, other vim specific }
         Raises an exception upon error or if not found

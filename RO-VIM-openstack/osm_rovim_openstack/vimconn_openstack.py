@@ -1258,12 +1258,15 @@ class vimconnector(vimconn.VimConnector):
             net_dict[net_id] = net
         return net_dict
 
-    def get_flavor(self, flavor_id):
+    def get_flavor(self, flavor_id=None, flavor_name=None):
         """Obtain flavor details from the  VIM. Returns the flavor dict details"""
         self.logger.debug("Getting flavor '%s'", flavor_id)
         try:
             self._reload_connection()
-            flavor = self.nova.flavors.find(id=flavor_id)
+            if flavor_id:
+                flavor = self.nova.flavors.find(id=flavor_id)
+            else:
+                flavor = self.nova.flavors.find(name=flavor_name)
             return flavor.to_dict()
 
         except (

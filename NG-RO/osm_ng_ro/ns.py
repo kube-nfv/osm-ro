@@ -840,6 +840,14 @@ class Ns(object):
         if vim_flavor_id:  # vim-flavor-id was passed so flavor won't be created
             return {"find_params": {"vim_flavor_id": vim_flavor_id}}
 
+        vim_flavor_name = (
+            target_vdur.get("additionalParams", {})
+            .get("OSM", {})
+            .get("vim_flavor_name")
+        )
+        if vim_flavor_name:  # vim-flavor-name was passed so flavor won't be created
+            return {"find_params": {"vim_flavor_name": vim_flavor_name}}
+
         flavor_data = {
             "disk": int(target_flavor["storage-gb"]),
             "ram": int(target_flavor["memory-mb"]),
