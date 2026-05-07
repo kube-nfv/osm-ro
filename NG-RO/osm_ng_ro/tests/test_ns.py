@@ -5833,3 +5833,56 @@ class TestSFC(unittest.TestCase):
 
         result = self.ns._process_vnfgd_classification(classification, db_vnfrs)
         self.assertEqual(expected_result, result)
+
+
+class TestDeployWithNoVnfs(unittest.TestCase):
+    def setUp(self):
+        self.ns = Ns()
+        self.ns.logger = MagicMock()
+        self.ns.db = MagicMock()
+        self.ns.write_lock = MagicMock()
+        self.nsr_id = "cc012f03-f4bb-4c1a-b8fa-000000000002"
+
+    def _make_get_one(self):
+        def _get_one(collection, *args, **kwargs):
+            if collection == "nsrs":
+                return {"_id": self.nsr_id}
+            if collection == "ro_nsrs":
+                return {"_id": self.nsr_id, "actions": []}
+            return None
+
+        return _get_one
+
+    @patch("osm_ng_ro.ns.validate_input")
+    def test_deploy_vld_only_ns_does_not_raise(self, _mock_validate):
+        self.ns.db.get_one.side_effect = self._make_get_one()
+        self.ns.db.get_list.return_value = []
+        with patch.object(
+            self.ns, "calculate_all_differences_to_deploy", return_value=[]
+        ):
+            with patch.object(self.ns, "define_all_tasks"):
+                with patch.object(self.ns, "upload_all_tasks"):
+                    result, action_id, _ = self.ns.deploy(
+                        session={},
+                        indata={"action_id": "test-action-id"},
+                        version="1.0",
+                        nsr_id=self.nsr_id,
+                    )
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["nsr_id"], self.nsr_id)
+
+    @patch("osm_ng_ro.ns.validate_input")
+    def test_recreate_vld_only_ns_does_not_raise(self, _mock_validate):
+        self.ns.db.get_one.side_effect = self._make_get_one()
+        self.ns.db.get_list.return_value = []
+        with patch.object(self.ns, "prepare_changes_to_recreate", return_value=[]):
+            with patch.object(self.ns, "define_all_tasks"):
+                with patch.object(self.ns, "upload_recreate_tasks"):
+                    result, action_id, _ = self.ns.recreate(
+                        session={},
+                        indata={"action_id": "test-action-id"},
+                        version="1.0",
+                        nsr_id=self.nsr_id,
+                    )
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["nsr_id"], self.nsr_id)

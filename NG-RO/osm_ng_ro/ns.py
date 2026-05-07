@@ -3129,9 +3129,6 @@ class Ns(object):
             db_vnfrs_list = self.db.get_list("vnfrs", {"nsr-id-ref": nsr_id})
             self.logger.debug("ns.recreate: db_vnfrs_list={}".format(db_vnfrs_list))
 
-            if not db_vnfrs_list:
-                raise NsException("Cannot obtain associated VNF for ns")
-
             for vnfr in db_vnfrs_list:
                 db_vnfrs[vnfr["_id"]] = vnfr
 
@@ -3229,9 +3226,6 @@ class Ns(object):
             # read from db: vnf's of this ns
             step = "Getting vnfrs from db"
             db_vnfrs_list = self.db.get_list("vnfrs", {"nsr-id-ref": nsr_id})
-
-            if not db_vnfrs_list:
-                raise NsException("Cannot obtain associated VNF for ns")
 
             for vnfr in db_vnfrs_list:
                 db_vnfrs[vnfr["_id"]] = vnfr
