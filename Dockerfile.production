@@ -68,8 +68,8 @@ WORKDIR /app/ro
 RUN python -m venv /app/ro/.venv
 ENV PATH="/app/ro/.venv/bin:$PATH"
 
-ARG COMMON_GERRIT_REFSPEC=master
-ARG IM_GERRIT_REFSPEC=master
+ARG COMMON_REFSPEC=master
+ARG IM_REFSPEC=master
 
 # Install build tools
 RUN pip install -U pip setuptools wheel build
@@ -78,9 +78,9 @@ RUN test -x /app/ro/.venv/bin/python && /app/ro/.venv/bin/python -c "import sys;
 
 # Install OSM dependency modules
 
-RUN git clone --filter=blob:none --tags https://osm.etsi.org/gerrit/osm/common.git /tmp/osm-common && \
+RUN git clone --filter=blob:none --tags https://osm.etsi.org/gitlab/osm/common.git /tmp/osm-common && \
   cd /tmp/osm-common && \
-  git fetch origin ${COMMON_GERRIT_REFSPEC} && \
+  git fetch origin ${COMMON_REFSPEC} && \
   git checkout FETCH_HEAD && \
   cd - && \
   pip install -r /tmp/osm-common/requirements.txt && \
