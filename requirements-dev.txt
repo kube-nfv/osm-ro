@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #######################################################################################
-aiokafka==0.13.0
+aiokafka==0.14.0
     # via
     #   -r https://osm.etsi.org/gitlab/osm/common/-/raw/master/requirements.txt
     #   osm-common
@@ -38,7 +38,7 @@ motor==3.7.1
     #   osm-common
 osm-common @ git+https://osm.etsi.org/gitlab/osm/common.git@master
     # via -r requirements-dev.in
-packaging==26.0
+packaging==26.2
     # via
     #   -r https://osm.etsi.org/gitlab/osm/common/-/raw/master/requirements.txt
     #   aiokafka
@@ -47,7 +47,7 @@ pycryptodome==3.23.0
     # via
     #   -r https://osm.etsi.org/gitlab/osm/common/-/raw/master/requirements.txt
     #   osm-common
-pymongo==4.16.0
+pymongo==4.17.0
     # via
     #   -r https://osm.etsi.org/gitlab/osm/common/-/raw/master/requirements.txt
     #   motor
