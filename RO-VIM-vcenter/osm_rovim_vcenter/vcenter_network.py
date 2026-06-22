@@ -224,7 +224,7 @@ class VCenterNetworkUtil:
             )
             raise vimconn.VimConnConflictException(
                 f"Distributed port group with name: {port_group_name} already exists"
-            ) from e
+            ) from None
 
     def delete_distributed_port_group(self, port_group):
         """
