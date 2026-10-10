@@ -645,11 +645,6 @@ class vimconnector(vimconn.VimConnector):
             vcImageId=Identifier(value=image_id),
         )
 
-        """
-        req.meta_data = Metadata(fields={
-            "kubernetes.io/description": description,
-        })
-        """
         req.interface_data = []
         req.interface_ipam = []
         for net in net_list:
