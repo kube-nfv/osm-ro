@@ -17,6 +17,7 @@
 ##
 
 from setuptools import setup
+
 _name = "osm_rovim_kubevim"
 _version_command = ("git describe --match v* --tags --long --dirty", "pep440-git-full")
 _description = "OSM ro vim plugin for kube-vim"
