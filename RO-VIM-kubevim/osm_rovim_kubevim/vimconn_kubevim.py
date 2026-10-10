@@ -605,9 +605,9 @@ class vimconnector(vimconn.VimConnector):
         img_filter = ""
         if filter_dict is not None and len(filter_dict) != 0:
             img_filter = "filter="
-        for filter_name, filter_val in filter_dict.items():
+        for filter_name, filter_val in (filter_dict or {}).items():
             if filter_name == "id":
-                img_filter += f"(eq,flavourId/value,{filter_val});"
+                img_filter += f"(eq,softwareImageId/value,{filter_val});"
             elif filter_name == "name":
                 img_filter += f"(eq,name,{filter_val});"
             elif filter_name == "location":
