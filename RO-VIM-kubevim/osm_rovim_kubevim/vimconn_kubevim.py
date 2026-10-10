@@ -868,7 +868,9 @@ class vimconnector(vimconn.VimConnector):
         return res
 
     def action_vminstance(self, vm_id, action_dict, created_items={}):
-        return None
+        raise vimconn.VimConnNotSupportedException(
+            "vm actions are not supported by Kube-VIM yet"
+        )
 
     def inject_user_key(
         self, ip_addr=None, user=None, key=None, ro_key=None, password=None
