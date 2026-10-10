@@ -78,17 +78,21 @@ def network_from_virtual_network_response(net: VirtualNetwork):
         res["status"] = "OTHER"
         res["error_msg"] = f"Undefined state {state}"
     net_type = net.network_type
-    if net_type == "OVERLAY":
+    if net_type == "NETWORK_TYPE_OVERLAY":
         res["network_type"] = "vxlan"
         # NOTE: kube-vim use ovn as a network soltion, while
         # ovn (might) use vxlan for the overlays it is lacks of the
         # specific "segmentation_id" for the network.
         res["segmentation_id"] = 0
-    elif net_type == "UNDERLAY":
+    elif net_type == "NETWORK_TYPE_UNDERLAY":
         if net.segmentation_id is None or net.segmentation_id == "0":
             res["network_type"] = "flat"
         else:
             res["network_type"] = "vlan"
+            res["segmentation_id"] = int(net.segmentation_id)
+    elif net_type == "NETWORK_TYPE_SRIOV":
+        res["network_type"] = "SR-IOV"
+        if net.segmentation_id and int(net.segmentation_id) != 0:
             res["segmentation_id"] = int(net.segmentation_id)
     res["shared"] = net.is_shared
     res = {**res, **net.to_dict()}
@@ -194,10 +198,9 @@ class vimconnector(vimconn.VimConnector):
 
         # TODO: Add dhcp pool
         if net_type in ["data", "ptp"] or provider_network_profile:
-            net.network_type = NetworkType("UNDERLAY")
             if provider_network_profile is None:
                 raise vimconn.VimConnNotSupportedException(f"provider network should be defined for the {net_type} network type")
-            net.provider_network = (
+            physical_network = (
                 provider_network_profile.get("physical-network")
                 or provider_network_profile.get("provider_network")
             )
@@ -205,13 +208,22 @@ class vimconnector(vimconn.VimConnector):
                 provider_network_profile.get("segmentation-id")
                 or provider_network_profile.get("segmentation_id")
             )
-            if seg_id and str(seg_id) != "0":
-                net.segmentation_id = str(seg_id)
+            if provider_network_profile.get("network-type") == "sriov":
+                net.network_type = NetworkType("NETWORK_TYPE_SRIOV")
+                net.provider_network = physical_network
+                if seg_id and str(seg_id) != "0":
+                    net.segmentation_id = str(seg_id)
+            else:
+                net.network_type = NetworkType("NETWORK_TYPE_UNDERLAY")
+                net.provider_network = physical_network
+                if seg_id and str(seg_id) != "0":
+                    net.segmentation_id = str(seg_id)
+                if subnet:
+                    net.layer3_attributes = [subnet]
         else:
-            net.network_type = NetworkType("OVERLAY")
-
-        if subnet:
-            net.layer3_attributes = [subnet]
+            net.network_type = NetworkType("NETWORK_TYPE_OVERLAY")
+            if subnet:
+                net.layer3_attributes = [subnet]
 
         req.type_network_data = net
         with ApiClient(self.configuration) as api_client:
@@ -532,12 +544,12 @@ class vimconnector(vimconn.VimConnector):
         for net in net_list:
             nic_type = None
             if net["type"] == "virtual":
-                nic_type = TypeVirtualNic.BRIDGE
+                nic_type = TypeVirtualNic.TYPE_VIRTUAL_NIC_BRIDGE
             elif net["type"] == "PCI_PASSTHROUGH" or net["type"] == "PF":
-                nic_type = TypeVirtualNic.PATHTHROUGH
+                nic_type = TypeVirtualNic.TYPE_VIRTUAL_NIC_PATHTHROUGH
             # TODO: Differentiate shared and not shared VF's
             elif net["type"] == "SR-IOV" or net["type"] == "VF" or net["type"] == "VFnotShared":
-                nic_type = TypeVirtualNic.SRIOV
+                nic_type = TypeVirtualNic.TYPE_VIRTUAL_NIC_SRIOV
             else:
                 raise vimconn.VimConnNotSupportedException(f'unknown network type: {net["type"]}')
 
