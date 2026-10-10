@@ -18,6 +18,8 @@ adal==1.2.7
     # via msrestazure
 annotated-doc==0.0.4
     # via typer
+annotated-types==0.8.0
+    # via pydantic
 atpublic==7.0.0
     # via flufl-enum
 attrs==26.1.0
@@ -186,6 +188,8 @@ keystoneauth1==5.14.0
     #   python-keystoneclient
     #   python-neutronclient
     #   python-novaclient
+kubevim-vivnfm-client==0.0.5a15
+    # via -r RO-VIM-kubevim/requirements.in
 logutils==0.3.5
     # via -r /home/ggdb/osm/RO/NG-RO/requirements.in
 lxml==6.1.1
@@ -331,6 +335,10 @@ pyasn1-modules==0.4.2
     # via google-auth
 pycparser==3.0
     # via cffi
+pydantic==2.13.5
+    # via kubevim-vivnfm-client
+pydantic-core==2.46.5
+    # via pydantic
 pygments==2.20.0
     # via
     #   pyvcloud
@@ -358,6 +366,7 @@ python-cinderclient==7.4.1
 python-dateutil==2.9.0.post0
     # via
     #   adal
+    #   kubevim-vivnfm-client
     #   oslo-log
     #   tempora
 python-glanceclient==4.12.0
@@ -469,16 +478,24 @@ typing-extensions==4.15.0
     #   dogpile-cache
     #   flufl-enum
     #   keystoneauth1
+    #   kubevim-vivnfm-client
     #   openstacksdk
     #   os-service-types
     #   oslo-context
+    #   pydantic
+    #   pydantic-core
     #   pyjwt
     #   pyopenssl
     #   referencing
+    #   typing-inspection
+typing-inspection==0.4.4
+    # via pydantic
 uritemplate==4.2.0
     # via google-api-python-client
 urllib3==2.7.0
-    # via requests
+    # via
+    #   kubevim-vivnfm-client
+    #   requests
 uuid==1.30
     # via -r /home/ggdb/osm/RO/RO-SDN-arista_cloudvision/requirements.in
 warlock==2.1.0

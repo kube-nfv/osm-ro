@@ -545,7 +545,7 @@ class VimConnector:
             flavor_data contains a dictionary with information, keys:
                 name: flavor name
                 ram: memory (cloud type) in MBytes
-                vpcus: cpus (cloud type)
+                vcpus: cpus (cloud type)
                 extended: EPA parameters
                   - numas: #items requested in same NUMA
                         memory: number of 1G huge pages memory

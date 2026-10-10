@@ -83,6 +83,7 @@ parts:
       - ./RO-SDN-arista_cloudvision
       - ./RO-SDN-juniper_contrail
       - ./RO-VIM-gcp
+      - ./RO-VIM-kubevim
       - ./RO-SDN-tapi
     build-packages:
       - wget
