@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 ##
+# Copyright ETSI Contributors and Others.
+#
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
 # a copy of the License at
@@ -11,12 +13,16 @@
 # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations
 # under the License.
-#
-# For those usages not covered by the Apache License, Version 2.0 please
-# contact with: saboor.ahmad@xflowresearch.com
 ##
-
 """
+osm-ro VIM connector plugin for Kube-VIM.
+
+It implements the VimConnector interface defined by RO-plugin on top of the
+Kube-VIM Vi-Vnfm (ETSI GS NFV-IFA 006) REST gateway, accessed through the
+``kubevim-vivnfm-client`` package. The VIM account ``url`` is the gateway URL.
+
+VIM account ``config`` keys:
+    ssh_key: private key used by inject_user_key to reach the VMs
 """
 
 import enum
