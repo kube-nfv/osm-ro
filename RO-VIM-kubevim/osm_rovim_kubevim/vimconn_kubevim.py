@@ -656,8 +656,10 @@ class vimconnector(vimconn.VimConnector):
             nic_type = None
             if net["type"] == "virtual":
                 nic_type = TypeVirtualNic.TYPE_VIRTUAL_NIC_BRIDGE
-            elif net["type"] == "PCI_PASSTHROUGH" or net["type"] == "PF":
-                nic_type = TypeVirtualNic.TYPE_VIRTUAL_NIC_PATHTHROUGH
+            elif net["type"] in ("PCI-PASSTHROUGH", "PCI_PASSTHROUGH", "PF"):
+                raise vimconn.VimConnNotSupportedException(
+                    f'PCI passthrough interface ({net["type"]}) is not supported by Kube-VIM'
+                )
             # TODO: Differentiate shared and not shared VF's
             elif (
                 net["type"] == "SR-IOV"
