@@ -79,6 +79,7 @@ from kubevim_vivnfm_client.models.virtual_network_interface_ipam import (
 )
 from kubevim_vivnfm_client.models.virtual_storage_data import VirtualStorageData
 from osm_ro_plugin import vimconn
+import urllib3
 import yaml
 
 
@@ -263,7 +264,7 @@ class vimconnector(vimconn.VimConnector):
                     raise vimconn.VimConnUnexpectedResponse("received empty response")
                 net_id = api_response.network_data.network_resource_id.value
                 return net_id, {}
-            except ApiException as ex:
+            except (ApiException, urllib3.exceptions.HTTPError) as ex:
                 self._format_exception(ex)
 
     def get_network_list(self, filter_dict=None):
@@ -301,7 +302,7 @@ class vimconnector(vimconn.VimConnector):
                     for net in api_response.query_network_result:
                         res.append(network_from_virtual_network_response(net))
                 return res
-            except ApiException as ex:
+            except (ApiException, urllib3.exceptions.HTTPError) as ex:
                 self._format_exception(ex)
 
     def get_network(self, net_id):
@@ -330,7 +331,7 @@ class vimconnector(vimconn.VimConnector):
                     )
                 net_data = net_data_lst[0]
                 return network_from_virtual_network_response(net_data)
-            except ApiException as ex:
+            except (ApiException, urllib3.exceptions.HTTPError) as ex:
                 self._format_exception(ex)
 
     def delete_network(self, net_id, created_items=None):
@@ -343,7 +344,7 @@ class vimconnector(vimconn.VimConnector):
                 if api_response is None or api_response.network_resource_id is None:
                     raise vimconn.VimConnUnexpectedResponse("received empty response")
                 return api_response.network_resource_id.value
-            except ApiException as ex:
+            except (ApiException, urllib3.exceptions.HTTPError) as ex:
                 self._format_exception(ex)
 
     def refresh_nets_status(self, net_list):
@@ -432,7 +433,7 @@ class vimconnector(vimconn.VimConnector):
                     "name": flavor.metadata.fields[flavNameAnn],
                 }
                 return resp
-            except ApiException as e:
+            except (ApiException, urllib3.exceptions.HTTPError) as e:
                 self._format_exception(e)
 
     def new_flavor(self, flavor_data):
@@ -468,7 +469,7 @@ class vimconnector(vimconn.VimConnector):
                     )
                 flavor_id = flavor_id.value
                 return flavor_id
-            except ApiException as e:
+            except (ApiException, urllib3.exceptions.HTTPError) as e:
                 self._format_exception(e)
 
     def delete_flavor(self, flavor_id):
@@ -480,7 +481,7 @@ class vimconnector(vimconn.VimConnector):
                     compute_flavour_id_value=flavor_id
                 )
                 return flavor_id
-            except ApiException as ex:
+            except (ApiException, urllib3.exceptions.HTTPError) as ex:
                 self._format_exception(ex)
 
     def get_flavor_id_from_data(self, flavor_dict):
@@ -506,7 +507,7 @@ class vimconnector(vimconn.VimConnector):
                         "flavor_id can't be empty in flavor query response"
                     )
                 return flavor.flavour_id.value
-            except ApiException as e:
+            except (ApiException, urllib3.exceptions.HTTPError) as e:
                 self._format_exception(e)
 
     def new_image(self, image_dict):
@@ -540,7 +541,7 @@ class vimconnector(vimconn.VimConnector):
                 )
                 self.images[sw_img_id] = new_image_dict
                 return sw_img_id
-        except ApiException as e:
+        except (ApiException, urllib3.exceptions.HTTPError) as e:
             self._format_exception(e)
 
     def delete_image(self, image_id):
@@ -597,7 +598,7 @@ class vimconnector(vimconn.VimConnector):
                         img_dict["location"] = "None"
                     resp.append(img_dict)
                 return resp
-            except ApiException as e:
+            except (ApiException, urllib3.exceptions.HTTPError) as e:
                 self._format_exception(e)
 
     def new_vminstance(
@@ -720,7 +721,7 @@ class vimconnector(vimconn.VimConnector):
                                 ifaceNet,
                             )
                 return vm_id, None
-            except ApiException as ex:
+            except (ApiException, urllib3.exceptions.HTTPError) as ex:
                 self._format_exception(ex)
 
     def get_vminstance(self, vm_id):
@@ -746,7 +747,7 @@ class vimconnector(vimconn.VimConnector):
                     )
                 vm_info = api_response.query_result[0]
                 return convert_enums(vm_info.model_dump(by_alias=True))
-            except ApiException as ex:
+            except (ApiException, urllib3.exceptions.HTTPError) as ex:
                 self._format_exception(ex)
 
     def delete_vminstance(self, vm_id, created_items=None, volumes_to_hold=None):
@@ -765,7 +766,7 @@ class vimconnector(vimconn.VimConnector):
                         f"delete vm id {api_response.compute_id.value} mismatch input id {vm_id}"
                     )
                 return vm_id
-            except ApiException as ex:
+            except (ApiException, urllib3.exceptions.HTTPError) as ex:
                 self._format_exception(ex)
 
     def refresh_vms_status(self, vm_list: List):
