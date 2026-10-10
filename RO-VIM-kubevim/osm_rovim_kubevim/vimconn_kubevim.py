@@ -171,6 +171,15 @@ class vimconnector(vimconn.VimConnector):
 
         self.images = dict()
 
+    def check_vim_connectivity(self):
+        self.logger.debug("Check VIM connectivity")
+        with ApiClient(self.configuration) as api_client:
+            api_instance = vi_vnfm_api.ViVnfmApi(api_client)
+            try:
+                api_instance.vi_vnfm_query_compute_flavour()
+            except (ApiException, urllib3.exceptions.HTTPError) as ex:
+                self._format_exception(ex)
+
     def new_network(
         self,
         net_name,
