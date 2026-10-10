@@ -632,6 +632,12 @@ class vimconnector(vimconn.VimConnector):
             flavor_id,
             net_list,
         )
+        # Interfaces are matched back to net_list by net_id, so it must be unique
+        net_ids = [net["net_id"] for net in net_list if net.get("net_id")]
+        if len(net_ids) != len(set(net_ids)):
+            raise vimconn.VimConnNotSupportedException(
+                "more than one interface on the same network is not supported"
+            )
         req = PbAllocateComputeRequest(
             computeFlavourId=Identifier(value=flavor_id),
             computeName=name,
