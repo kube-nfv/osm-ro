@@ -791,7 +791,7 @@ class vimconnector(vimconn.VimConnector):
                 continue
             except Exception as ex:
                 res[vm_id] = {
-                    "status": "ERROR",
+                    "status": "VIM_ERROR",
                     "error_msg": str(ex),
                 }
                 continue
@@ -805,7 +805,7 @@ class vimconnector(vimconn.VimConnector):
                 if reason_meta_label in metadata:
                     err_msg = metadata[reason_meta_label]
                 res[vm_id] = {
-                    "status": running_state,
+                    "status": "ERROR",
                     "error_msg": err_msg,
                 }
                 continue
