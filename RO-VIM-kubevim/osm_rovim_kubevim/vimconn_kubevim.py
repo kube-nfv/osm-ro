@@ -59,7 +59,6 @@ from kubevim_vivnfm_client.models.pb_allocate_network_request import (
 from kubevim_vivnfm_client.models.pb_create_compute_flavour_request import (
     PbCreateComputeFlavourRequest,
 )
-from kubevim_vivnfm_client.models.pb_query_image_request import PbQueryImageRequest
 from kubevim_vivnfm_client.models.resource_quantity import ResourceQuantity
 from kubevim_vivnfm_client.models.type_virtual_nic import TypeVirtualNic
 from kubevim_vivnfm_client.models.user_data import UserData
@@ -195,8 +194,6 @@ class vimconnector(vimconn.VimConnector):
         self.configuration = Configuration(host=url)
         if log_level:
             self.logger.setLevel(getattr(logging, log_level))
-
-        self.images = dict()
 
     def check_vim_connectivity(self):
         self.logger.debug("Check VIM connectivity")
@@ -561,45 +558,6 @@ class vimconnector(vimconn.VimConnector):
                 return flavor.flavour_id.value
             except (ApiException, urllib3.exceptions.HTTPError) as e:
                 self._format_exception(e)
-
-    def new_image(self, image_dict):
-        new_image_dict = {"name": image_dict["name"]}
-        if image_dict.get("description"):
-            new_image_dict["description"] = image_dict["description"]
-        if image_dict.get("metadata"):
-            new_image_dict["metadata"] = yaml.load(
-                image_dict["metadata"],
-                Loader=yaml.SafeLoader,
-            )
-        if image_dict.get("location"):
-            new_image_dict["path"] = image_dict["location"]
-        else:
-            raise vimconn.VimConnException(
-                "image_dict should have location for the image"
-            )
-        try:
-            with ApiClient(self.configuration) as api_client:
-                api_instance = vi_vnfm_api.ViVnfmApi(api_client=api_client)
-
-                api_response = api_instance.vi_vnfm_query_image2(
-                    PbQueryImageRequest(
-                        softwareImageId=Identifier(value=new_image_dict["path"])
-                    )
-                )
-                if api_response.software_image_information is None:
-                    raise vimconn.VimConnException("empty image creation response")
-                sw_img_id = (
-                    api_response.software_image_information.software_image_id.value
-                )
-                self.images[sw_img_id] = new_image_dict
-                return sw_img_id
-        except (ApiException, urllib3.exceptions.HTTPError) as e:
-            self._format_exception(e)
-
-    def delete_image(self, image_id):
-        # TODO: Implement this
-        self.logger.debug("Delete image unimplemeneted")
-        return image_id
 
     def get_image_list(self, filter_dict={}):
         img_filter = ""
