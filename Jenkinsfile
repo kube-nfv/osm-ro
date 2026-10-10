@@ -1,49 +1,234 @@
-/* Copyright ETSI OSM and others
- *
- * All Rights Reserved.
- *
- *   Licensed under the Apache License, Version 2.0 (the "License"); you may
- *   not use this file except in compliance with the License. You may obtain
- *   a copy of the License at
- *
- *        http://www.apache.org/licenses/LICENSE-2.0
- *
- *   Unless required by applicable law or agreed to in writing, software
- *   distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
- *   WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
- *   License for the specific language governing permissions and limitations
- *   under the License.
- */
+/*
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
 
-properties([
-    parameters([
-        string(defaultValue: env.BRANCH_NAME, description: '', name: 'GERRIT_BRANCH'),
-        string(defaultValue: 'osm/RO', description: '', name: 'GERRIT_PROJECT'),
-        string(defaultValue: env.GERRIT_REFSPEC, description: '', name: 'GERRIT_REFSPEC'),
-        string(defaultValue: env.GERRIT_PATCHSET_REVISION, description: '', name: 'GERRIT_PATCHSET_REVISION'),
-        string(defaultValue: 'https://osm.etsi.org/gerrit', description: '', name: 'PROJECT_URL_PREFIX'),
-        booleanParam(defaultValue: false, description: '', name: 'TEST_INSTALL'),
-        string(defaultValue: 'artifactory-osm', description: '', name: 'ARTIFACTORY_SERVER'),
-    ])
-])
+     http://www.apache.org/licenses/LICENSE-2.0
 
-def devops_checkout() {
-    dir('devops') {
-        git url: "${PROJECT_URL_PREFIX}/osm/devops", branch: params.GERRIT_BRANCH
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY, either express or
+  implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+*/
+
+def DEFAULT_MODULE_NAME = 'ro'
+
+pipeline {
+  agent { label 'pool' }
+  options { disableConcurrentBuilds() }
+  parameters {
+    // Core GitLab / multibranch inputs
+    string(name: 'GITLAB_PROJECT', defaultValue: 'osm/RO', description: '')
+    string(name: 'GITLAB_SOURCE_BRANCH', defaultValue: env.CHANGE_BRANCH ?: env.BRANCH_NAME ?: 'master', description: '')
+    string(name: 'GITLAB_TARGET_BRANCH', defaultValue: env.CHANGE_TARGET ?: 'master', description: '')
+    string(name: 'PROJECT_URL_PREFIX', defaultValue: 'https://osm.etsi.org/gitlab', description: '')
+    string(name: 'DOCKER_ARGS', defaultValue: '', description: 'Extra docker args for docker run')
+
+    // E2E Test Parameters
+    string(name: 'MODULE_NAME', defaultValue: 'RO', description: 'Name of the module under test')
+    booleanParam(name: 'DO_ROBOT', defaultValue: true, description: '')
+    
+    // Image name for build and push for promotion
+    string(name: 'IMAGENAME', defaultValue: 'opensourcemano/ro', description: 'Image name for publish')
+  }
+  environment {
+    MDG = "${params.GITLAB_PROJECT?.contains('/') ? params.GITLAB_PROJECT.split('/')[1] : params.GITLAB_PROJECT}"
+    TEST_IMAGE = 'opensourcemano/tox-osm:19.0'
+    DOCKER_REGISTRY = 'osm.etsi.org:5050/devops/cicd/'
+  }
+  stages {
+    stage('CI') {
+      when {
+        anyOf {
+          changeRequest()
+          branch pattern: 'master|v19\\.0', comparator: 'REGEXP'
+        }
+      }
+      stages {
+        stage('Prepare') { steps { sh 'env' } }
+
+        stage('Checkout') {
+          steps {
+            checkout scm
+            script {
+              sh "git fetch --tags"
+              sh "sudo git clean -dfx || git clean -dfx"
+            }
+          }
+        }
+
+        stage('Clone devops (central)') {
+          steps {
+            dir('devops') {
+              sh "git init ."
+              sh "git remote remove origin || true"
+              sh "git remote add origin ${params.PROJECT_URL_PREFIX}/osm/devops"
+              sh "git fetch --depth=1 origin ${params.GITLAB_TARGET_BRANCH}"
+              sh "git checkout -f FETCH_HEAD"
+            }
+          }
+        }
+
+        stage('License Scan') {
+          steps {
+            script {
+              sh 'devops/tools/license_scan.sh'
+            }
+          }
+        }
+
+        stage('Prepare Test Image') {
+          steps {
+            script {
+              // Use shared test image from registry; no local build needed
+              sh "docker pull ${env.TEST_IMAGE} || true"
+            }
+          }
+        }
+
+        stage('Tests') {
+          steps {
+            script {
+              def UID = sh(returnStdout: true, script: 'id -u').trim()
+              def GID = sh(returnStdout: true, script: 'id -g').trim()
+              def common = "-v ${env.WORKSPACE}:/tests -e UID=${UID} -e GID=${GID} " + (params.DOCKER_ARGS ?: '')
+
+              stage('Linting Tests') {
+                sh """
+                  docker run --rm ${common} \
+                    ${env.TEST_IMAGE} \
+                    /tests/devops-stages/stage-lint.sh
+                """
+              }
+
+              stage('Unit Tests') {
+                sh """
+                  docker run --rm ${common} \
+                    ${env.TEST_IMAGE} \
+                    /tests/devops-stages/stage-test.sh
+                """
+                if (fileExists('coverage.xml')) {
+                  recordCoverage tools: [[
+                    parser: 'COBERTURA',
+                    pattern: 'coverage.xml'
+                  ]], sourceDirectories: []
+                }
+
+                if (fileExists('nosetests.xml')) {
+                  junit 'nosetests.xml'
+                }
+              }
+
+              stage('Changelog') {
+                sh 'mkdir -p changelog'
+                sh """
+                  docker run --rm ${common} \
+                    ${env.TEST_IMAGE} \
+                    sh -c 'devops/tools/generatechangelog-pipeline.sh > /tests/changelog/changelog-${MDG}.html'
+                """
+              }
+            }
+          }
+        }
+
+        stage('Build & Push Image') {
+          steps {
+            script {
+              def moduleName = (env.MDG ?: DEFAULT_MODULE_NAME).toLowerCase()
+
+              if (!params.GITLAB_SOURCE_BRANCH) {
+                error 'GITLAB_SOURCE_BRANCH is required to tag the Docker image'
+              }
+              def sanitizedBranchName = params.GITLAB_SOURCE_BRANCH
+                .toLowerCase()
+                .replaceAll('[^a-z0-9._-]', '-')
+              def baseTagPrefix = "osm-${sanitizedBranchName}"
+              def buildNumber = env.BUILD_NUMBER ?: '0'
+              def isMergeJob = !env.JOB_BASE_NAME.contains('MR')
+              // Remove promotion logic from this stage
+              def moduleTags = []
+              if (isMergeJob) {
+                moduleTags << "${baseTagPrefix}-merge"
+              } else {
+                moduleTags << "${baseTagPrefix}-patchset-${buildNumber}"
+              }
+
+              def imageName = params.IMAGENAME ?: "opensourcemano/${moduleName}"
+              def primaryLocalImage = "${imageName}:${moduleTags[0]}"
+
+              withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'gitlab-registry',
+                                usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD']]) {
+                sh """
+                  docker build -f Dockerfile -t ${primaryLocalImage} .
+                """
+                sh "docker login ${env.DOCKER_REGISTRY.split('/')[0]} -u ${USERNAME} -p ${PASSWORD}"
+                // Push build-scope tag(s) only. Promotion happens after tests.
+                moduleTags.each { tag ->
+                  def localImage = "${imageName}:${tag}"
+                  def remoteImage = "${env.DOCKER_REGISTRY}${imageName}:${tag}"
+                  sh "docker tag ${localImage} ${remoteImage}"
+                  sh "docker push ${remoteImage}"
+                }
+                // Stash the built image id for later promotion without rebuild
+                env.BUILT_IMAGE = primaryLocalImage
+                env.BUILT_TAG = moduleTags[0]
+              }
+            }
+          }
+        }
+
+        stage('E2E Test (robot)') {
+          when { expression { return params.DO_ROBOT && env.JOB_BASE_NAME.contains('MR') } }
+          steps {
+            script {
+              def dowstreamJob = "osm-e2e/${params.GITLAB_TARGET_BRANCH ?: 'master'}"
+              build job: dowstreamJob,
+                parameters: [
+                  string(name: 'DO_IMAGE_PROMOTION_TO_DOCKERHUB', value: 'false'),
+                  string(name: 'GITLAB_BRANCH', value: params.GITLAB_TARGET_BRANCH),
+                  string(name: 'MODULE_NAME', value: params.MODULE_NAME ?: 'RO'),
+                  string(name: 'MODULE_BUILT_TAG', value: env.BUILT_TAG),
+                  string(name: 'ROBOT_TAG_NAME', value: 'sanity')
+                ]
+            }
+          }
+        }
+
+        stage('Image Promotion') {
+          when { expression { return !env.JOB_BASE_NAME.contains('MR') } }
+          steps {
+            script {
+              def moduleName = (env.MDG ?: DEFAULT_MODULE_NAME).toLowerCase()
+              def sanitizedBranchName = params.GITLAB_SOURCE_BRANCH
+                .toLowerCase()
+                .replaceAll('[^a-z0-9._-]', '-')
+              def baseTagPrefix = "osm-${sanitizedBranchName}"
+              def targetTag = "${baseTagPrefix}-merge"
+              def imageName = params.IMAGENAME ?: "opensourcemano/${moduleName}"
+
+              withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'gitlab-registry',
+                                usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD']]) {
+                sh "docker login ${env.DOCKER_REGISTRY.split('/')[0]} -u ${USERNAME} -p ${PASSWORD}"
+                def remoteImage = "${env.DOCKER_REGISTRY}${imageName}:${targetTag}"
+                sh "docker tag ${env.BUILT_IMAGE} ${remoteImage}"
+                sh "docker push ${remoteImage}"
+              }
+            }
+          }
+        }
+
+        /*
+        Promotion should be done in a separate downstream job after E2E success to avoid
+        */
+      }
     }
-}
+  }
 
-node('stage_2') {
-    checkout scm
-    devops_checkout()
-
-    ci_helper = load "devops/jenkins/ci-pipelines/ci_stage_2.groovy"
-    ci_helper.ci_pipeline( 'RO',
-                           params.PROJECT_URL_PREFIX,
-                           params.GERRIT_PROJECT,
-                           params.GERRIT_BRANCH,
-                           params.GERRIT_REFSPEC,
-                           params.GERRIT_PATCHSET_REVISION,
-                           params.TEST_INSTALL,
-                           params.ARTIFACTORY_SERVER)
+  post {
+    always {
+      cleanWs()
+    }
+  }
 }

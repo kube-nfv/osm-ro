@@ -14,4 +14,4 @@
 # limitations under the License.
 ##
 
-kubevim-vivnfm-client=0.0.5a15
+kubevim-vivnfm-client==0.0.5a15

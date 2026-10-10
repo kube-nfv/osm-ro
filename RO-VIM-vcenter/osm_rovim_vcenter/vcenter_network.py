@@ -217,14 +217,14 @@ class VCenterNetworkUtil:
             net_key = DISTRIBUTED_PORTGROUP_KEY_PREFIX + port_group.key
 
             return net_key, port_group
-        except vim.fault.DuplicateName as e:
+        except vim.fault.DuplicateName:
             self.logger.error(
                 f"Distributed port group with name: {port_group_name} already exists",
                 exc_info=True,
             )
             raise vimconn.VimConnConflictException(
                 f"Distributed port group with name: {port_group_name} already exists"
-            ) from e
+            ) from None
 
     def delete_distributed_port_group(self, port_group):
         """

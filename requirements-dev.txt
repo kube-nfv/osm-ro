@@ -14,50 +14,50 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #######################################################################################
-aiokafka==0.13.0
+aiokafka==0.14.0
     # via
-    #   -r https://osm.etsi.org/gitweb/?p=osm/common.git;a=blob_plain;f=requirements.txt;hb=master
+    #   -r https://osm.etsi.org/gitlab/osm/common/-/raw/master/requirements.txt
     #   osm-common
 async-timeout==4.0.3
     # via
-    #   -r https://osm.etsi.org/gitweb/?p=osm/common.git;a=blob_plain;f=requirements.txt;hb=master
+    #   -r https://osm.etsi.org/gitlab/osm/common/-/raw/master/requirements.txt
     #   aiokafka
     #   osm-common
 dataclasses==0.6
     # via
-    #   -r https://osm.etsi.org/gitweb/?p=osm/common.git;a=blob_plain;f=requirements.txt;hb=master
+    #   -r https://osm.etsi.org/gitlab/osm/common/-/raw/master/requirements.txt
     #   osm-common
 dnspython==2.8.0
     # via
-    #   -r https://osm.etsi.org/gitweb/?p=osm/common.git;a=blob_plain;f=requirements.txt;hb=master
+    #   -r https://osm.etsi.org/gitlab/osm/common/-/raw/master/requirements.txt
     #   osm-common
     #   pymongo
 motor==3.7.1
     # via
-    #   -r https://osm.etsi.org/gitweb/?p=osm/common.git;a=blob_plain;f=requirements.txt;hb=master
+    #   -r https://osm.etsi.org/gitlab/osm/common/-/raw/master/requirements.txt
     #   osm-common
-osm-common @ git+https://osm.etsi.org/gerrit/osm/common.git@master
+osm-common @ git+https://osm.etsi.org/gitlab/osm/common.git@master
     # via -r requirements-dev.in
-packaging==26.0
+packaging==26.2
     # via
-    #   -r https://osm.etsi.org/gitweb/?p=osm/common.git;a=blob_plain;f=requirements.txt;hb=master
+    #   -r https://osm.etsi.org/gitlab/osm/common/-/raw/master/requirements.txt
     #   aiokafka
     #   osm-common
 pycryptodome==3.23.0
     # via
-    #   -r https://osm.etsi.org/gitweb/?p=osm/common.git;a=blob_plain;f=requirements.txt;hb=master
+    #   -r https://osm.etsi.org/gitlab/osm/common/-/raw/master/requirements.txt
     #   osm-common
-pymongo==4.16.0
+pymongo==4.17.0
     # via
-    #   -r https://osm.etsi.org/gitweb/?p=osm/common.git;a=blob_plain;f=requirements.txt;hb=master
+    #   -r https://osm.etsi.org/gitlab/osm/common/-/raw/master/requirements.txt
     #   motor
     #   osm-common
 pyyaml==6.0.3
     # via
-    #   -r https://osm.etsi.org/gitweb/?p=osm/common.git;a=blob_plain;f=requirements.txt;hb=master
+    #   -r https://osm.etsi.org/gitlab/osm/common/-/raw/master/requirements.txt
     #   osm-common
 typing-extensions==4.15.0
     # via
-    #   -r https://osm.etsi.org/gitweb/?p=osm/common.git;a=blob_plain;f=requirements.txt;hb=master
+    #   -r https://osm.etsi.org/gitlab/osm/common/-/raw/master/requirements.txt
     #   aiokafka
     #   osm-common

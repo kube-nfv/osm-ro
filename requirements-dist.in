@@ -13,6 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-stdeb
-setuptools-version-command
-setuptools<60
+build
+setuptools-scm
+setuptools>=61
