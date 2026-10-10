@@ -136,6 +136,33 @@ def convert_enums(obj: Any) -> Any:
     return obj
 
 
+QUANTITY_SUFFIXES = {
+    "": 1,
+    "k": 10**3,
+    "M": 10**6,
+    "G": 10**9,
+    "T": 10**12,
+    "P": 10**15,
+    "E": 10**18,
+    "Ki": 2**10,
+    "Mi": 2**20,
+    "Gi": 2**30,
+    "Ti": 2**40,
+    "Pi": 2**50,
+    "Ei": 2**60,
+}
+
+
+def quantity_to_bytes(quantity: str) -> float:
+    """Converts a Kubernetes quantity string (e.g. "2048M", "10Gi") to bytes."""
+    number = quantity.rstrip("kMGTPEi")
+    suffix = quantity[len(number) :]
+    try:
+        return float(number) * QUANTITY_SUFFIXES[suffix]
+    except (KeyError, ValueError):
+        raise vimconn.VimConnUnexpectedResponse(f"invalid quantity: {quantity}")
+
+
 class vimconnector(vimconn.VimConnector):
     def __init__(
         self,
@@ -391,7 +418,7 @@ class vimconnector(vimconn.VimConnector):
                 res[net_id] = {"status": "VIM_ERROR", "error_msg": ex.__str__()}
         return res
 
-    def get_flavor(self, flavor_id, flavor_name):
+    def get_flavor(self, flavor_id=None, flavor_name=None):
         self.logger.debug(
             "Flavour id: %s, name: %s get request", flavor_id, flavor_name
         )
@@ -437,9 +464,25 @@ class vimconnector(vimconn.VimConnector):
                         f"flavor missing metadata fields: {flavor_id}"
                     )
 
+                boot_storage = [s for s in flavor.storage_attributes or [] if s.is_boot]
+                if not boot_storage:
+                    raise vimconn.VimConnUnexpectedResponse(
+                        f"flavor missing boot storage: {flavor_id}"
+                    )
+
+                # Same units new_flavor writes: ram in MB (M), disk in GiB (Gi)
                 resp = {
                     "id": rsp_flavor_id,
                     "name": flavor.metadata.fields[flavNameAnn],
+                    "ram": round(
+                        quantity_to_bytes(flavor.virtual_memory.virtual_mem_size.string)
+                        / 10**6
+                    ),
+                    "vcpus": flavor.virtual_cpu.num_virtual_cpu,
+                    "disk": round(
+                        quantity_to_bytes(boot_storage[0].size_of_storage.string)
+                        / 2**30
+                    ),
                 }
                 return resp
             except (ApiException, urllib3.exceptions.HTTPError) as e:
