@@ -729,7 +729,7 @@ class vimconnector(vimconn.VimConnector):
                                 cfgIface["vim_id"],
                                 ifaceNet,
                             )
-                return vm_id, None
+                return vm_id, {}
             except (ApiException, urllib3.exceptions.HTTPError) as ex:
                 self._format_exception(ex)
 
