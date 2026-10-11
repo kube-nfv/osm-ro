@@ -338,6 +338,14 @@ class TestNewNetwork(KubevimTestCase):
         self.assertEqual(subnet["ipVersion"], "IPV6")
         self.assertTrue(subnet["isDhcpEnabled"])
 
+    def test_gateway_none(self):
+        body = self.allocate(
+            "net-a",
+            "bridge",
+            ip_profile={"subnet_address": "10.0.0.0/24", "gateway_address": None},
+        )
+        self.assertNotIn("gatewayIp", body["typeNetworkData"]["layer3Attributes"][0])
+
     def test_dhcp_disabled_as_string(self):
         body = self.allocate(
             "net-a",

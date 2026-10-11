@@ -243,7 +243,7 @@ class vimconnector(vimconn.VimConnector):
             subnet.ip_version = IPVersion("IPV4")
         elif ip_profile["ip_version"] == "IPv6":
             subnet.ip_version = IPVersion("IPV6")
-        if "gateway_address" in ip_profile:
+        if ip_profile.get("gateway_address"):
             subnet.gateway_ip = IPAddress(ip=ip_profile["gateway_address"])
         subnet.cidr = IPSubnetCIDR(cidr=ip_profile["subnet_address"])
 
