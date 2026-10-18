@@ -22,6 +22,7 @@ mapping and response deserialization. Responses use Kube-VIM's wire format and a
 checked against the client models, which are generated from the kube-vim-api schema.
 """
 
+import base64
 import json
 import logging
 import unittest
@@ -285,6 +286,234 @@ class TestErrorMapping(KubevimTestCase):
     def test_log_level(self):
         conn = vimconnector("vim-uuid", "kubevim", None, None, URL, log_level="DEBUG")
         self.assertEqual(conn.logger.level, logging.DEBUG)
+
+
+ISSUER = "https://idp.test/realms/nfv"
+TOKEN_URL = ISSUER + "/protocol/openid-connect/token"
+
+
+def idp(status, body):
+    return urllib3.HTTPResponse(
+        body=json.dumps(body).encode(),
+        status=status,
+        headers={"Content-Type": "application/json"},
+        preload_content=True,
+    )
+
+
+def token(value, expires_in=300):
+    return idp(
+        200, {"access_token": value, "token_type": "Bearer", "expires_in": expires_in}
+    )
+
+
+class TestAuth(KubevimTestCase):
+    """OAuth 2.0 client credentials against the IdP, whose HTTP layer is mocked."""
+
+    def setUp(self):
+        super().setUp()
+        patcher = patch.object(urllib3.PoolManager, "request", autospec=True)
+        self.idp = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def connect(self, user="osm-ro", passwd="s3cret", **config):
+        return vimconnector(
+            "vim-uuid",
+            "kubevim",
+            None,
+            None,
+            URL,
+            user=user,
+            passwd=passwd,
+            config=config,
+        )
+
+    def authorization(self, index=-1):
+        return self.request.call_args_list[index].kwargs["headers"].get("Authorization")
+
+    def test_no_auth_without_token_endpoint(self):
+        self.respond(flavours())
+        self.conn.check_vim_connectivity()
+        self.assertIsNone(self.authorization())
+        self.idp.assert_not_called()
+
+    def test_token_request(self):
+        self.idp.side_effect = [token("t1")]
+        self.respond(flavours())
+        self.connect(token_url=TOKEN_URL).check_vim_connectivity()
+        self.assertEqual(self.authorization(), "Bearer t1")
+        call = self.idp.call_args
+        self.assertEqual(call.args[1:], ("POST", TOKEN_URL))
+        self.assertEqual(call.kwargs["fields"], {"grant_type": "client_credentials"})
+        self.assertFalse(call.kwargs["encode_multipart"])
+        basic = base64.b64encode(b"osm-ro:s3cret").decode()
+        self.assertEqual(call.kwargs["headers"]["Authorization"], f"Basic {basic}")
+
+    def test_scope(self):
+        self.idp.side_effect = [token("t1")]
+        self.respond(flavours())
+        self.connect(token_url=TOKEN_URL, scope="kubevim").check_vim_connectivity()
+        self.assertEqual(self.idp.call_args.kwargs["fields"]["scope"], "kubevim")
+
+    def test_credentials_are_form_encoded(self):
+        self.idp.side_effect = [token("t1")]
+        self.respond(flavours())
+        conn = self.connect(user="a:b", passwd="p@ss w", token_url=TOKEN_URL)
+        conn.check_vim_connectivity()
+        basic = base64.b64encode(b"a%3Ab:p%40ss+w").decode()
+        self.assertEqual(
+            self.idp.call_args.kwargs["headers"]["Authorization"], f"Basic {basic}"
+        )
+
+    def test_token_cached(self):
+        self.idp.side_effect = [token("t1")]
+        self.respond(flavours(), flavours())
+        conn = self.connect(token_url=TOKEN_URL)
+        conn.check_vim_connectivity()
+        conn.check_vim_connectivity()
+        self.assertEqual(self.idp.call_count, 1)
+        self.assertEqual(self.authorization(), "Bearer t1")
+
+    def test_token_refreshed_before_expiry(self):
+        self.idp.side_effect = [token("t1", expires_in=300), token("t2")]
+        self.respond(flavours(), flavours(), flavours())
+        conn = self.connect(token_url=TOKEN_URL)
+        with patch("time.monotonic", side_effect=[1000.0, 1269.0, 1271.0, 1271.0]):
+            conn.check_vim_connectivity()
+            conn.check_vim_connectivity()
+            self.assertEqual(self.authorization(), "Bearer t1")
+            conn.check_vim_connectivity()
+        self.assertEqual(self.authorization(), "Bearer t2")
+        self.assertEqual(self.idp.call_count, 2)
+
+    def test_token_without_expiry_is_kept(self):
+        self.idp.side_effect = [
+            idp(200, {"access_token": "t1", "token_type": "Bearer"})
+        ]
+        self.respond(flavours(), flavours())
+        conn = self.connect(token_url=TOKEN_URL)
+        conn.check_vim_connectivity()
+        conn.check_vim_connectivity()
+        self.assertEqual(self.idp.call_count, 1)
+
+    def test_rejected_token_is_refreshed_once(self):
+        self.idp.side_effect = [token("t1"), token("t2")]
+        self.respond(error(401), flavours())
+        self.connect(token_url=TOKEN_URL).check_vim_connectivity()
+        self.assertEqual(self.authorization(0), "Bearer t1")
+        self.assertEqual(self.authorization(1), "Bearer t2")
+        self.assertEqual(self.sent(1), ("GET", "/vivnfm/v5/flavours", {}, None))
+
+    def test_rejected_again_raises(self):
+        self.idp.side_effect = [token("t1"), token("t2")]
+        self.respond(error(401), error(401))
+        with self.assertRaises(vimconn.VimConnAuthException):
+            self.connect(token_url=TOKEN_URL).check_vim_connectivity()
+        self.assertEqual(self.request.call_count, 2)
+
+    def test_bad_client_credentials(self):
+        for status in (400, 401):
+            with self.subTest(status=status):
+                self.idp.side_effect = [idp(status, {"error": "invalid_client"})]
+                with self.assertRaises(vimconn.VimConnAuthException):
+                    self.connect(token_url=TOKEN_URL).check_vim_connectivity()
+        self.request.assert_not_called()
+
+    def test_idp_server_error(self):
+        self.idp.side_effect = [idp(503, {})]
+        with self.assertRaises(vimconn.VimConnConnectionException):
+            self.connect(token_url=TOKEN_URL).check_vim_connectivity()
+
+    def test_idp_unreachable(self):
+        self.idp.side_effect = urllib3.exceptions.MaxRetryError(None, TOKEN_URL)
+        with self.assertRaises(vimconn.VimConnConnectionException):
+            self.connect(token_url=TOKEN_URL).check_vim_connectivity()
+
+    def test_token_response_without_token(self):
+        for body in ({"token_type": "Bearer"}, ["not", "an", "object"]):
+            with self.subTest(body=body):
+                self.idp.side_effect = [idp(200, body)]
+                with self.assertRaises(vimconn.VimConnUnexpectedResponse):
+                    self.connect(token_url=TOKEN_URL).check_vim_connectivity()
+
+    def test_issuer_discovery(self):
+        self.idp.side_effect = [
+            idp(200, {"issuer": ISSUER, "token_endpoint": TOKEN_URL}),
+            token("t1", expires_in=0),
+            token("t2"),
+        ]
+        self.respond(flavours(), flavours())
+        conn = self.connect(issuer=ISSUER + "/")
+        conn.check_vim_connectivity()
+        conn.check_vim_connectivity()
+        urls = [(c.args[1], c.args[2]) for c in self.idp.call_args_list]
+        self.assertEqual(
+            urls,
+            [
+                ("GET", ISSUER + "/.well-known/openid-configuration"),
+                ("POST", TOKEN_URL),
+                ("POST", TOKEN_URL),
+            ],
+        )
+        self.assertEqual(self.authorization(), "Bearer t2")
+
+    def test_discovery_without_token_endpoint(self):
+        self.idp.side_effect = [idp(200, {"issuer": ISSUER})]
+        with self.assertRaises(vimconn.VimConnUnexpectedResponse):
+            self.connect(issuer=ISSUER).check_vim_connectivity()
+
+    def test_token_url_wins_over_issuer(self):
+        self.idp.side_effect = [token("t1")]
+        self.respond(flavours())
+        self.connect(token_url=TOKEN_URL, issuer=ISSUER).check_vim_connectivity()
+        self.assertEqual(self.idp.call_count, 1)
+        self.assertEqual(self.idp.call_args.args[2], TOKEN_URL)
+
+    def test_credentials_required(self):
+        for user, passwd in ((None, "s3cret"), ("osm-ro", None), ("", "")):
+            with self.subTest(user=user, passwd=passwd):
+                with self.assertRaises(vimconn.VimConnException):
+                    self.connect(user=user, passwd=passwd, token_url=TOKEN_URL)
+
+    def test_ca_cert(self):
+        conn = self.connect(token_url=TOKEN_URL, ca_cert="/etc/ro/ca.pem")
+        self.assertEqual(conn.configuration.ssl_ca_cert, "/etc/ro/ca.pem")
+        self.assertEqual(
+            conn._idp_http.connection_pool_kw["ca_certs"], "/etc/ro/ca.pem"
+        )
+        self.assertEqual(
+            conn._idp_http.connection_pool_kw["cert_reqs"], "CERT_REQUIRED"
+        )
+
+    def test_insecure(self):
+        conn = self.connect(token_url=TOKEN_URL, insecure=True)
+        self.assertFalse(conn.configuration.verify_ssl)
+        self.assertEqual(conn._idp_http.connection_pool_kw["cert_reqs"], "CERT_NONE")
+
+    def test_insecure_and_ca_cert_exclusive(self):
+        with self.assertRaises(vimconn.VimConnException):
+            self.connect(token_url=TOKEN_URL, insecure=True, ca_cert="/etc/ro/ca.pem")
+
+    def test_secret_and_token_not_logged(self):
+        self.respond(error(401), flavours())
+        self.idp.side_effect = [token("tok-value"), token("tok-value-2")]
+        conn = vimconnector(
+            "vim-uuid",
+            "kubevim",
+            None,
+            None,
+            URL,
+            user="osm-ro",
+            passwd="s3cret",
+            log_level="DEBUG",
+            config={"token_url": TOKEN_URL},
+        )
+        with self.assertLogs("ro.vim.kubevim", level="DEBUG") as logs:
+            conn.check_vim_connectivity()
+        output = "\n".join(logs.output)
+        self.assertIn("osm-ro", output)
+        for secret in ("s3cret", "tok-value"):
+            self.assertNotIn(secret, output)
 
 
 class TestNewNetwork(KubevimTestCase):

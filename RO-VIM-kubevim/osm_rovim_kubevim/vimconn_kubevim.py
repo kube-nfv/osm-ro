@@ -22,13 +22,31 @@ Kube-VIM Vi-Vnfm (ETSI GS NFV-IFA 006) REST gateway, accessed through the
 ``kubevim-vivnfm-client`` package. The VIM account ``url`` is the gateway URL.
 
 VIM account ``config`` keys:
+    management_network_name: existing Kube-VIM network that VLDs marked
+        mgmt-network are mapped onto instead of creating one, typically the
+        management network kube-vim provisions (read by NG-RO, which looks it up
+        through get_network_list)
+    management_network_id: the same by network ID; takes precedence over the name
     ssh_key: private key used by inject_user_key to reach the VMs
+    token_url: OAuth 2.0 token endpoint. When set, or when issuer is set, requests
+        carry a client-credentials access token; the VIM account user and password
+        are the client ID and secret
+    issuer: OIDC issuer whose discovery document gives the token endpoint, used when
+        token_url is not set
+    scope: optional scope for the token request
+    ca_cert: CA bundle for the gateway and the token endpoint (NG-RO writes
+        ca_cert_content to this file)
+    insecure: skip TLS certificate verification; exclusive with ca_cert
 """
 
+import base64
 import enum
+import json
 import logging
 import random
+import time
 from typing import Any, List
+from urllib.parse import quote_plus
 
 from kubevim_vivnfm_client.api import vi_vnfm_api
 from kubevim_vivnfm_client.api_client import ApiClient
@@ -162,6 +180,42 @@ def quantity_to_bytes(quantity: str) -> float:
         raise vimconn.VimConnUnexpectedResponse(f"invalid quantity: {quantity}")
 
 
+# Seconds before expiry at which a cached access token is replaced
+TOKEN_REFRESH_MARGIN = 30
+
+
+class _AuthApiClient(ApiClient):
+    """ApiClient that sends the connector's bearer token and retries a 401 once."""
+
+    def __init__(self, configuration, connector):
+        super().__init__(configuration)
+        self._connector = connector
+        self.set_default_header("Authorization", f"Bearer {connector._access_token()}")
+
+    def call_api(
+        self,
+        method,
+        url,
+        header_params=None,
+        body=None,
+        post_params=None,
+        _request_timeout=None,
+    ):
+        response = super().call_api(
+            method, url, header_params, body, post_params, _request_timeout
+        )
+        if response.status != 401:
+            return response
+        self._connector.logger.debug("Access token rejected, fetching a new one")
+        self._connector._token = None
+        bearer = f"Bearer {self._connector._access_token()}"
+        self.set_default_header("Authorization", bearer)
+        header_params = {**(header_params or {}), "Authorization": bearer}
+        return super().call_api(
+            method, url, header_params, body, post_params, _request_timeout
+        )
+
+
 class vimconnector(vimconn.VimConnector):
     def __init__(
         self,
@@ -191,13 +245,40 @@ class vimconnector(vimconn.VimConnector):
             persistent_info,
         )
         self.logger = logging.getLogger("ro.vim.kubevim")
-        self.configuration = Configuration(host=url)
         if log_level:
             self.logger.setLevel(getattr(logging, log_level))
 
+        insecure = self.config.get("insecure")
+        ca_cert = self.config.get("ca_cert")
+        if insecure and ca_cert:
+            raise vimconn.VimConnException(
+                "options insecure and ca_cert are mutually exclusive"
+            )
+        self.configuration = Configuration(host=url)
+        if ca_cert:
+            self.configuration.ssl_ca_cert = ca_cert
+        if insecure:
+            self.configuration.verify_ssl = False
+
+        self._token_url = self.config.get("token_url")
+        self._issuer = self.config.get("issuer")
+        self._token = None
+        self._token_expiry = None
+        self._idp_http = None
+        if self._token_url or self._issuer:
+            if not self.user or not self.passwd:
+                raise vimconn.VimConnException(
+                    "token_url or issuer needs the VIM account user and password "
+                    "as the OAuth 2.0 client ID and secret"
+                )
+            self._idp_http = urllib3.PoolManager(
+                cert_reqs="CERT_NONE" if insecure else "CERT_REQUIRED",
+                ca_certs=ca_cert,
+            )
+
     def check_vim_connectivity(self):
         self.logger.debug("Check VIM connectivity")
-        with ApiClient(self.configuration) as api_client:
+        with self._api_client() as api_client:
             api_instance = vi_vnfm_api.ViVnfmApi(api_client)
             try:
                 api_instance.vi_vnfm_query_compute_flavour()
@@ -287,7 +368,7 @@ class vimconnector(vimconn.VimConnector):
                 net.layer3_attributes = [subnet]
 
         req.type_network_data = net
-        with ApiClient(self.configuration) as api_client:
+        with self._api_client() as api_client:
             api_instance = vi_vnfm_api.ViVnfmApi(api_client)
             try:
                 api_response = (
@@ -302,7 +383,7 @@ class vimconnector(vimconn.VimConnector):
 
     def get_network_list(self, filter_dict=None):
         self.logger.debug("Get Networks. Filter dict: %s", filter_dict)
-        with ApiClient(self.configuration) as api_client:
+        with self._api_client() as api_client:
             api_instance = vi_vnfm_api.ViVnfmApi(api_client)
             query_filter = ""
             if filter_dict:
@@ -340,7 +421,7 @@ class vimconnector(vimconn.VimConnector):
 
     def get_network(self, net_id):
         self.logger.debug("Network %s get request", net_id)
-        with ApiClient(self.configuration) as api_client:
+        with self._api_client() as api_client:
             api_instance = vi_vnfm_api.ViVnfmApi(api_client)
             query_filter = f"filter=(eq,networkResourceId/value,{net_id})"
             try:
@@ -368,7 +449,7 @@ class vimconnector(vimconn.VimConnector):
                 self._format_exception(ex)
 
     def delete_network(self, net_id, created_items=None):
-        with ApiClient(self.configuration) as api_client:
+        with self._api_client() as api_client:
             api_instance = vi_vnfm_api.ViVnfmApi(api_client)
             try:
                 api_response = (
@@ -423,7 +504,7 @@ class vimconnector(vimconn.VimConnector):
             raise vimconn.VimConnNotSupportedException(
                 "Get flavor by name is not supported"
             )
-        with ApiClient(self.configuration) as api_client:
+        with self._api_client() as api_client:
             api_instance = vi_vnfm_api.ViVnfmApi(api_client)
             query_filter = f"filter=(eq,flavourId/value,{flavor_id})"
             try:
@@ -487,7 +568,7 @@ class vimconnector(vimconn.VimConnector):
 
     def new_flavor(self, flavor_data):
         self.logger.debug("new flavour creation with data %s requested", flavor_data)
-        with ApiClient(self.configuration) as api_client:
+        with self._api_client() as api_client:
             api_instance = vi_vnfm_api.ViVnfmApi(api_client=api_client)
 
             mem = VirtualMemoryData(
@@ -523,7 +604,7 @@ class vimconnector(vimconn.VimConnector):
 
     def delete_flavor(self, flavor_id):
         self.logger.debug("Flavour %s delete request", flavor_id)
-        with ApiClient(self.configuration) as api_client:
+        with self._api_client() as api_client:
             api_instance = vi_vnfm_api.ViVnfmApi(api_client)
             try:
                 api_instance.vi_vnfm_delete_compute_flavour(
@@ -534,7 +615,7 @@ class vimconnector(vimconn.VimConnector):
                 self._format_exception(ex)
 
     def get_flavor_id_from_data(self, flavor_dict):
-        with ApiClient(self.configuration) as api_client:
+        with self._api_client() as api_client:
             api_instance = vi_vnfm_api.ViVnfmApi(api_client)
             query_filter = f'filter=(eq,virtualMemory/virtualMemSize,{flavor_dict["ram"]}M);(eq,virtualCpu/numVirtualCpu,{flavor_dict["vcpus"]});(eq,storageAttributes/sizeOfStorage,{flavor_dict["disk"]}Gi)'
             try:
@@ -581,7 +662,7 @@ class vimconnector(vimconn.VimConnector):
         self.logger.debug(
             "Image list request: %s. Filter query: %s", filter_dict, img_filter
         )
-        with ApiClient(self.configuration) as api_client:
+        with self._api_client() as api_client:
             api_instance = vi_vnfm_api.ViVnfmApi(api_client)
             try:
                 api_response = api_instance.vi_vnfm_query_images(img_filter)
@@ -696,7 +777,7 @@ class vimconnector(vimconn.VimConnector):
                 content=str(userdata),
                 method=UserDataUserDataTransportationMethod.NO_CLOUD,
             )
-        with ApiClient(self.configuration) as api_client:
+        with self._api_client() as api_client:
             api_instance = vi_vnfm_api.ViVnfmApi(api_client)
             try:
                 vm_data = api_instance.vi_vnfm_allocate_virtualised_compute_resource(
@@ -739,7 +820,7 @@ class vimconnector(vimconn.VimConnector):
 
     def get_vminstance(self, vm_id):
         self.logger.debug("Compute %s get request", vm_id)
-        with ApiClient(self.configuration) as api_client:
+        with self._api_client() as api_client:
             api_instance = vi_vnfm_api.ViVnfmApi(api_client)
             query_filter = f"filter=(eq,computeId/value,{vm_id})"
             try:
@@ -766,7 +847,7 @@ class vimconnector(vimconn.VimConnector):
     def delete_vminstance(self, vm_id, created_items=None, volumes_to_hold=None):
         # Currently only vm_id is enough
         self.logger.debug("Compute %s delete request", vm_id)
-        with ApiClient(self.configuration) as api_client:
+        with self._api_client() as api_client:
             api_instance = vi_vnfm_api.ViVnfmApi(api_client)
             try:
                 api_response = (
@@ -879,6 +960,80 @@ class vimconnector(vimconn.VimConnector):
         return super().inject_user_key(
             ip_addr=ip_addr, user=user, key=key, ro_key=ro_key, password=password
         )
+
+    def _api_client(self):
+        if self._idp_http is None:
+            return ApiClient(self.configuration)
+        return _AuthApiClient(self.configuration, self)
+
+    def _access_token(self):
+        """Returns a cached client-credentials access token, fetching one when due."""
+        if self._token and (
+            self._token_expiry is None or time.monotonic() < self._token_expiry
+        ):
+            return self._token
+        if not self._token_url:
+            self._token_url = self._discover_token_url()
+        fields = {"grant_type": "client_credentials"}
+        if self.config.get("scope"):
+            fields["scope"] = self.config["scope"]
+        # RFC 6749 section 2.3.1: client ID and secret are form-encoded before Basic
+        credentials = f"{quote_plus(self.user)}:{quote_plus(self.passwd)}".encode()
+        body = self._idp_request(
+            "POST",
+            self._token_url,
+            fields=fields,
+            encode_multipart=False,
+            headers={
+                "Authorization": "Basic " + base64.b64encode(credentials).decode()
+            },
+        )
+        if not isinstance(body, dict) or not body.get("access_token"):
+            raise vimconn.VimConnUnexpectedResponse(
+                f"token response from {self._token_url} has no access_token"
+            )
+        self._token = body["access_token"]
+        expires_in = body.get("expires_in")
+        self._token_expiry = (
+            time.monotonic() + expires_in - TOKEN_REFRESH_MARGIN
+            if expires_in is not None
+            else None
+        )
+        self.logger.debug(
+            "Fetched access token for client %s, expires in %ss", self.user, expires_in
+        )
+        return self._token
+
+    def _discover_token_url(self):
+        url = self._issuer.rstrip("/") + "/.well-known/openid-configuration"
+        body = self._idp_request("GET", url)
+        token_url = body.get("token_endpoint") if isinstance(body, dict) else None
+        if not token_url:
+            raise vimconn.VimConnUnexpectedResponse(f"no token_endpoint in {url}")
+        return token_url
+
+    def _idp_request(self, method, url, **kwargs):
+        """Calls the IdP and returns the decoded JSON body."""
+        try:
+            response = self._idp_http.request(method, url, **kwargs)
+        except urllib3.exceptions.HTTPError as ex:
+            raise vimconn.VimConnConnectionException(f"cannot reach {url}: {ex}")
+        try:
+            body = json.loads(response.data)
+        except ValueError:
+            body = None
+        if response.status in (400, 401):
+            error = body.get("error") if isinstance(body, dict) else None
+            raise vimconn.VimConnAuthException(
+                f"{url} rejected client {self.user}: {response.status} {error or ''}"
+            )
+        if response.status != 200:
+            raise vimconn.VimConnConnectionException(
+                f"{url} returned {response.status}"
+            )
+        if body is None:
+            raise vimconn.VimConnUnexpectedResponse(f"{url} returned invalid JSON")
+        return body
 
     def _format_exception(self, exception: ApiException):
         """Raises a vimconn exception if the requests to the api is not OK"""
