@@ -162,6 +162,8 @@ def split_physical_network(physical_network: str):
     return provider, pool
 
 
+UNSUPPORTED_FLAVOR_KEYS = ("extended", "ephemeral", "swap")
+
 QUANTITY_SUFFIXES = {
     "": 1,
     "k": 10**3,
@@ -181,7 +183,7 @@ QUANTITY_SUFFIXES = {
 
 def quantity_to_bytes(quantity: str) -> float:
     """Converts a Kubernetes quantity string (e.g. "2048M", "10Gi") to bytes."""
-    number = quantity.rstrip("kMGTPEi")
+    number = quantity.rstrip("kKMGTPEi")
     suffix = quantity[len(number) :]
     try:
         return float(number) * QUANTITY_SUFFIXES[suffix]
@@ -311,6 +313,11 @@ class vimconnector(vimconn.VimConnector):
         )
         if not ip_profile:
             ip_profile = {}
+        for key in ("dns_address", "dhcp_start_address", "dhcp_count"):
+            if ip_profile.get(key):
+                raise vimconn.VimConnNotSupportedException(
+                    f"{key} in the ip-profile is not supported by Kube-VIM"
+                )
         if not ip_profile.get("subnet_address"):
             # Fake subnet is required
             subnet_rand = random.SystemRandom().randint(0, 255)
@@ -355,7 +362,12 @@ class vimconnector(vimconn.VimConnector):
             net.provider_network, pool = split_physical_network(physical_network)
             if seg_id and str(seg_id) != "0":
                 net.network_type = NetworkType.NETWORK_TYPE_VLAN
-                net.segmentation_id = int(seg_id)
+                try:
+                    net.segmentation_id = int(seg_id)
+                except ValueError:
+                    raise vimconn.VimConnNotSupportedException(
+                        f"segmentation-id {seg_id} is not a number"
+                    )
             else:
                 net.network_type = NetworkType.NETWORK_TYPE_FLAT
             if pool:
@@ -496,6 +508,15 @@ class vimconnector(vimconn.VimConnector):
 
     def new_flavor(self, flavor_data):
         self.logger.debug("new flavour creation with data %s requested", flavor_data)
+        for key in UNSUPPORTED_FLAVOR_KEYS:
+            if flavor_data.get(key):
+                raise vimconn.VimConnNotSupportedException(
+                    f"flavor {key} is not supported by Kube-VIM"
+                )
+        if not flavor_data["disk"]:
+            raise vimconn.VimConnNotSupportedException(
+                "a persistent root disk is not supported by Kube-VIM"
+            )
         flavor = Flavour(
             flavourName=flavor_data["name"],
             virtualMemory=VirtualMemoryData(virtualMemSize=f'{flavor_data["ram"]}M'),
@@ -531,6 +552,11 @@ class vimconnector(vimconn.VimConnector):
                 self._format_exception(ex)
 
     def get_flavor_id_from_data(self, flavor_dict):
+        # No flavour has these, so none matches; new_flavor then rejects the request.
+        if any(flavor_dict.get(key) for key in UNSUPPORTED_FLAVOR_KEYS):
+            raise vimconn.VimConnNotFoundException(
+                "Kube-VIM has no flavor with {}".format(UNSUPPORTED_FLAVOR_KEYS)
+            )
         query_filter = (
             f'(eq,virtualMemory/virtualMemSize,{flavor_dict["ram"]}M);'
             f'(eq,virtualCpu/numVirtualCpu,{flavor_dict["vcpus"]});'
@@ -618,6 +644,10 @@ class vimconnector(vimconn.VimConnector):
             flavor_id,
             net_list,
         )
+        if disk_list:
+            raise vimconn.VimConnNotSupportedException(
+                "additional disks are not supported by Kube-VIM"
+            )
         interfaces = []
         for idx, net in enumerate(net_list):
             if net["type"] == "virtual":
@@ -642,6 +672,10 @@ class vimconnector(vimconn.VimConnector):
             )
             if nic_type == TypeVirtualNic.TYPE_VIRTUAL_NIC_SRIOV:
                 # Kube-VIM assigns no addresses to SR-IOV interfaces; the guest does.
+                if net.get("ip_address"):
+                    raise vimconn.VimConnNotSupportedException(
+                        "an IP address on an SR-IOV interface is not supported by Kube-VIM"
+                    )
                 iface.ip_assignment = IpAssignment.IP_ASSIGNMENT_NONE
             elif net.get("ip_address"):
                 iface.ip_assignment = IpAssignment.IP_ASSIGNMENT_STATIC
@@ -656,21 +690,25 @@ class vimconnector(vimconn.VimConnector):
         )
         if start is False:
             req.start = False
-        _, userdata = self._create_user_data(cloud_config)
+        config_drive, userdata = self._create_user_data(cloud_config)
         if userdata:
             req.user_data = UserData(
                 content=str(userdata),
-                method=UserDataTransportationMethod.USER_DATA_TRANSPORTATION_METHOD_NO_CLOUD,
+                method=(
+                    UserDataTransportationMethod.USER_DATA_TRANSPORTATION_METHOD_CONFIG_DRIVE
+                    if config_drive
+                    else UserDataTransportationMethod.USER_DATA_TRANSPORTATION_METHOD_NO_CLOUD
+                ),
             )
         with self._api_client() as api_client:
             try:
                 vm = ComputeServiceApi(api_client).create_compute(req)
             except (ApiException, urllib3.exceptions.HTTPError) as ex:
                 self._format_exception(ex)
-        created = {iface.name for iface in vm.network_interfaces or []}
+        if vm is None or not vm.compute_id:
+            raise vimconn.VimConnUnexpectedResponse("received empty response")
         for net, iface in zip(net_list, interfaces):
-            if iface.name in created:
-                net["vim_id"] = iface.name
+            net["vim_id"] = iface.name
         return vm.compute_id, {}
 
     def get_vminstance(self, vm_id):
@@ -702,6 +740,13 @@ class vimconnector(vimconn.VimConnector):
             ComputeRunningState.COMPUTE_RUNNING_STATE_STOPPED.value: "INACTIVE",
             ComputeRunningState.COMPUTE_RUNNING_STATE_TERMINATING.value: "INACTIVE",
         }
+        # These have no interfaces up, and that does not mean they are building.
+        not_running = (
+            ComputeRunningState.COMPUTE_RUNNING_STATE_STOPPED.value,
+            ComputeRunningState.COMPUTE_RUNNING_STATE_STOPPING.value,
+            ComputeRunningState.COMPUTE_RUNNING_STATE_PAUSED.value,
+            ComputeRunningState.COMPUTE_RUNNING_STATE_TERMINATING.value,
+        )
         for vm_id in vm_list:
             try:
                 vm_info = self.get_vminstance(vm_id)
@@ -736,7 +781,8 @@ class vimconnector(vimconn.VimConnector):
                     != OperationalState.OPERATIONAL_STATE_ENABLED.value
                 ):
                     # Need to think if Active:NoMgmtIp is better suited here
-                    vm_status = "BUILD"
+                    if running_state not in not_running:
+                        vm_status = "BUILD"
                 ips = iface.get("ipAddresses") or []
                 iface_dict = {
                     "vim_info": yaml.safe_dump(iface),
@@ -807,13 +853,18 @@ class vimconnector(vimconn.VimConnector):
             raise vimconn.VimConnUnexpectedResponse(
                 f"token response from {self._token_url} has no access_token"
             )
-        self._token = body["access_token"]
         expires_in = body.get("expires_in")
-        self._token_expiry = (
-            time.monotonic() + expires_in - TOKEN_REFRESH_MARGIN
-            if expires_in is not None
-            else None
-        )
+        try:
+            self._token_expiry = (
+                time.monotonic() + float(expires_in) - TOKEN_REFRESH_MARGIN
+                if expires_in is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            raise vimconn.VimConnUnexpectedResponse(
+                f"token response from {self._token_url} has an invalid expires_in"
+            )
+        self._token = body["access_token"]
         self.logger.debug(
             "Fetched access token for client %s, expires in %ss", self.user, expires_in
         )

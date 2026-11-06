@@ -250,6 +250,7 @@ class TestHelpers(unittest.TestCase):
             "10Gi": 10 * 2**30,
             "1Ti": 2**40,
             "512Mi": 512 * 2**20,
+            "2097152Ki": 2097152 * 2**10,
             "100": 100,
             "1e3": 1000,
         }
@@ -471,6 +472,11 @@ class TestAuth(KubevimTestCase):
                 with self.assertRaises(vimconn.VimConnUnexpectedResponse):
                     self.connect(token_url=TOKEN_URL).check_vim_connectivity()
 
+    def test_invalid_expires_in(self):
+        self.idp.side_effect = [token("t1", expires_in="soon")]
+        with self.assertRaises(vimconn.VimConnUnexpectedResponse):
+            self.connect(token_url=TOKEN_URL).check_vim_connectivity()
+
     def test_issuer_discovery(self):
         self.idp.side_effect = [
             idp(200, {"issuer": ISSUER, "token_endpoint": TOKEN_URL}),
@@ -678,6 +684,27 @@ class TestNewNetwork(KubevimTestCase):
         self.assertEqual(net["sriov"], {"pool": "openshift.io/mlx_vf_pf0_vfio"})
         self.assertNotIn("layer3Attributes", net)
 
+    def test_unsupported_ip_profile(self):
+        cases = {
+            "dns_address": "8.8.8.8",
+            "dhcp_start_address": "10.0.0.10",
+            "dhcp_count": 10,
+        }
+        for key, value in cases.items():
+            with self.subTest(key):
+                with self.assertRaises(vimconn.VimConnNotSupportedException):
+                    self.conn.new_network("net", "bridge", ip_profile={key: value})
+        self.request.assert_not_called()
+
+    def test_ip_profile_keys_unset(self):
+        ip_profile = {
+            "subnet_address": "10.0.0.0/24",
+            "dns_address": None,
+            "dhcp_start_address": None,
+            "dhcp_count": None,
+        }
+        self.create("net", "bridge", ip_profile=ip_profile)
+
     def test_rejected_profiles(self):
         cases = {
             "no profile": ("data", None),
@@ -686,6 +713,10 @@ class TestNewNetwork(KubevimTestCase):
                 {"physical-network": "mx5p0", "network-type": "sriov"},
             ),
             "no physical network": ("data", {"segmentation-id": "100"}),
+            "segmentation id not a number": (
+                "data",
+                {"physical-network": "mx5p0", "segmentation-id": "abc"},
+            ),
         }
         for name, (net_type, profile) in cases.items():
             with self.subTest(name):
@@ -844,6 +875,27 @@ class TestFlavors(KubevimTestCase):
             },
         )
 
+    def test_new_flavor_unsupported(self):
+        base = {"name": "small", "ram": 2048, "vcpus": 2, "disk": 10}
+        cases = {
+            "extended": {"extended": {"cpu-pinning-policy": "DEDICATED"}},
+            "ephemeral": {"ephemeral": 5},
+            "swap": {"swap": 1},
+            "persistent root disk": {"disk": 0},
+        }
+        for name, extra in cases.items():
+            with self.subTest(name):
+                with self.assertRaises(vimconn.VimConnNotSupportedException):
+                    self.conn.new_flavor({**base, **extra})
+        self.request.assert_not_called()
+
+    def test_get_flavor_id_from_data_unsupported(self):
+        with self.assertRaises(vimconn.VimConnNotFoundException):
+            self.conn.get_flavor_id_from_data(
+                {"ram": 2048, "vcpus": 2, "disk": 10, "swap": 1}
+            )
+        self.request.assert_not_called()
+
     def test_new_flavor_api_error(self):
         self.respond(error(422, "unsupported-field"))
         with self.assertRaises(vimconn.VimConnNotSupportedException):
@@ -950,7 +1002,7 @@ class TestNewVminstance(KubevimTestCase):
                 "bw": 1,
             },
             {"net_id": NET_ID, "type": "virtual"},
-            {"net_id": NET_ID_2, "type": "SR-IOV", "ip_address": "10.1.0.5"},
+            {"net_id": NET_ID_2, "type": "SR-IOV"},
         ]
         body = self.create(
             net_list,
@@ -1016,6 +1068,46 @@ class TestNewVminstance(KubevimTestCase):
             },
         )
         self.assertIs(body["start"], False)
+
+    def test_user_data_config_drive(self):
+        with patch.object(
+            vimconnector, "_create_user_data", return_value=(True, "#cloud-config\n")
+        ):
+            body = self.create([], [], cloud_config={"boot-data-drive": True})
+        self.assertEqual(
+            body["userData"]["method"],
+            "USER_DATA_TRANSPORTATION_METHOD_CONFIG_DRIVE",
+        )
+
+    def test_vim_id_set_when_response_omits_interface(self):
+        net_list = [{"net_id": NET_ID, "type": "virtual"}]
+        self.create(net_list, [])
+        self.assertEqual(net_list[0]["vim_id"], "nic0")
+
+    def test_response_without_compute_id(self):
+        self.respond(created(Compute, {**compute(), "computeId": ""}))
+        with self.assertRaises(vimconn.VimConnUnexpectedResponse):
+            self.conn.new_vminstance("vm", "", True, IMAGE_ID, FLAVOUR_ID, [], [])
+
+    def test_disk_list_rejected(self):
+        with self.assertRaises(vimconn.VimConnNotSupportedException):
+            self.conn.new_vminstance(
+                "vm", "", True, IMAGE_ID, FLAVOUR_ID, [], [], disk_list=[{"size": 10}]
+            )
+        self.request.assert_not_called()
+
+    def test_ip_address_on_sriov_rejected(self):
+        with self.assertRaises(vimconn.VimConnNotSupportedException):
+            self.conn.new_vminstance(
+                "vm",
+                "",
+                True,
+                IMAGE_ID,
+                FLAVOUR_ID,
+                [],
+                [{"net_id": NET_ID, "type": "SR-IOV", "ip_address": "10.1.0.5"}],
+            )
+        self.request.assert_not_called()
 
     def test_rejected_interfaces(self):
         for nic_type in ("PCI-PASSTHROUGH", "PF", "unknown"):
@@ -1121,6 +1213,22 @@ class TestRefreshVmsStatus(KubevimTestCase):
             ["default", "nic0"],
         )
         self.assertIsNone(res["interfaces"][1]["ip_address"])
+
+    def test_not_running_state_is_kept_with_interfaces_down(self):
+        cases = {
+            "COMPUTE_RUNNING_STATE_STOPPED": "INACTIVE",
+            "COMPUTE_RUNNING_STATE_STOPPING": "INACTIVE",
+            "COMPUTE_RUNNING_STATE_TERMINATING": "INACTIVE",
+            "COMPUTE_RUNNING_STATE_PAUSED": "PAUSED",
+            "COMPUTE_RUNNING_STATE_STARTED": "BUILD",
+            "COMPUTE_RUNNING_STATE_UNSPECIFIED": "BUILD",
+        }
+        for state, status in cases.items():
+            with self.subTest(state=state):
+                res = self.refresh(
+                    compute(state=state, nics=[nic("default", mgmt=True, ready=False)])
+                )
+                self.assertEqual(res["status"], status)
 
     def test_running_states(self):
         cases = {
