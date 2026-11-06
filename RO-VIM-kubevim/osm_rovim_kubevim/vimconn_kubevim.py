@@ -737,7 +737,6 @@ class vimconnector(vimconn.VimConnector):
                 ):
                     # Need to think if Active:NoMgmtIp is better suited here
                     vm_status = "BUILD"
-                    continue
                 ips = iface.get("ipAddresses") or []
                 iface_dict = {
                     "vim_info": yaml.safe_dump(iface),

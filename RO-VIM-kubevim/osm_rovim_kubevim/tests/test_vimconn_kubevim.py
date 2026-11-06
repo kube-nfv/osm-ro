@@ -1107,9 +1107,20 @@ class TestRefreshVmsStatus(KubevimTestCase):
         self.assertIsNone(vf["ip_address"])
 
     def test_interface_not_ready_is_build(self):
-        res = self.refresh(compute(nics=[nic("nic0", NET_ID, ready=False)]))
+        res = self.refresh(
+            compute(
+                nics=[
+                    nic("default", mgmt=True, ip="10.16.0.5"),
+                    nic("nic0", NET_ID, ready=False),
+                ]
+            )
+        )
         self.assertEqual(res["status"], "BUILD")
-        self.assertEqual(res["interfaces"], [])
+        self.assertEqual(
+            [iface["vim_interface_id"] for iface in res["interfaces"]],
+            ["default", "nic0"],
+        )
+        self.assertIsNone(res["interfaces"][1]["ip_address"])
 
     def test_running_states(self):
         cases = {
