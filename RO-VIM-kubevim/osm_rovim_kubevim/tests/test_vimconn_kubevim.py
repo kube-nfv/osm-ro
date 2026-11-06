@@ -16,56 +16,41 @@
 ##
 """Unit tests for the Kube-VIM VIM connector.
 
-The HTTP layer of the generated kubevim-vivnfm-client is mocked, so every test runs
-the real client: URL and query building, request serialization, status-to-exception
-mapping and response deserialization. Responses use Kube-VIM's wire format and are
-checked against the client models, which are generated from the kube-vim-api schema.
+The HTTP layer of the generated kubevim-client is mocked, so every test runs the real
+client: URL and query building, request serialization, status-to-exception mapping and
+response deserialization. Responses use Kube-VIM's wire format and are checked against
+the client models, which are generated from the kube-vim-api schema.
 """
 
 import base64
+import io
 import json
 import logging
 import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
-from kubevim_vivnfm_client.models.pb_allocate_compute_response import (
-    PbAllocateComputeResponse,
-)
-from kubevim_vivnfm_client.models.pb_allocate_network_response import (
-    PbAllocateNetworkResponse,
-)
-from kubevim_vivnfm_client.models.pb_create_compute_flavour_response import (
-    PbCreateComputeFlavourResponse,
-)
-from kubevim_vivnfm_client.models.pb_query_compute_flavour_response import (
-    PbQueryComputeFlavourResponse,
-)
-from kubevim_vivnfm_client.models.pb_query_compute_response import (
-    PbQueryComputeResponse,
-)
-from kubevim_vivnfm_client.models.pb_query_images_response import (
-    PbQueryImagesResponse,
-)
-from kubevim_vivnfm_client.models.pb_query_network_response import (
-    PbQueryNetworkResponse,
-)
-from kubevim_vivnfm_client.models.pb_terminate_compute_response import (
-    PbTerminateComputeResponse,
-)
-from kubevim_vivnfm_client.models.pb_terminate_network_response import (
-    PbTerminateNetworkResponse,
-)
-from kubevim_vivnfm_client.rest import RESTClientObject, RESTResponse
+from kubevim_client.models.compute import Compute
+from kubevim_client.models.flavour import Flavour
+from kubevim_client.models.image import Image
+from kubevim_client.models.network import Network
+from kubevim_client.rest import RESTClientObject, RESTResponse
 from osm_ro_plugin import vimconn
-from osm_rovim_kubevim.vimconn_kubevim import quantity_to_bytes, vimconnector
+from osm_rovim_kubevim.vimconn_kubevim import (
+    quantity_to_bytes,
+    split_physical_network,
+    vimconnector,
+)
 import urllib3
 import yaml
 
 URL = "http://kubevim.test:8080"
-MGMT_KEY = "network.vm.kubevirt.io/management"
-READY_KEY = "interface.vm.kubevirt.io/ready"
-FLAVOUR_NAME_KEY = "flavour.kubevim.kubenfv.io/attached-name"
+NET_ID = "6f0d3c1e-8a52-4a8e-9a43-2f1d6b1c7e10"
+NET_ID_2 = "7a1e4d2f-9b63-4b9f-8b54-3e2f7c2d8f21"
+FLAVOUR_ID = "9a8b7c6d-5e4f-4a3b-9c2d-1e0f9a8b7c6d"
+IMAGE_ID = "5f0c9d2e-3a4b-4c1d-9e8f-0a1b2c3d4e5f"
+VM_ID = "d4e5f6a7-b8c9-4d0e-9f1a-2b3c4d5e6f7a"
+PROBLEMS = "https://kubevim.kubenfv.io/problems/"
 
 
 def _assert_known_keys(body, parsed, path="$"):
@@ -82,129 +67,152 @@ def _assert_known_keys(body, parsed, path="$"):
             _assert_known_keys(item, parsed_item, f"{path}[{i}]")
 
 
-def _http(status, body):
-    return RESTResponse(
-        urllib3.HTTPResponse(
+def _merge(a, b):
+    """Merges dict b into dict a, recursively."""
+    if not (isinstance(a, dict) and isinstance(b, dict)):
+        return b
+    return {k: _merge(a.get(k), b[k]) if k in b else a[k] for k in {**a, **b}}
+
+
+def _http(status, body=None, content_type="application/json"):
+    if body is None:
+        # An empty body is read from the stream, as from a real connection.
+        raw = urllib3.HTTPResponse(
+            body=io.BytesIO(b""), status=status, preload_content=False
+        )
+    else:
+        raw = urllib3.HTTPResponse(
             body=json.dumps(body).encode(),
             status=status,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": content_type},
             preload_content=True,
         )
-    )
+    return RESTResponse(raw)
 
 
-def ok(model, body):
-    """A 200 response whose body is validated against the response model."""
-    _assert_known_keys(body, model.from_dict(body).to_dict())
-    return _http(200, body)
+def ok(model, body, status=200):
+    """A response whose body, an object or a list of objects, is validated against model."""
+    for item in body if isinstance(body, list) else [body]:
+        parsed = model.from_dict(item)
+        # model_dump keeps read-only fields; to_dict sees through oneOf wrappers.
+        dumped = _merge(
+            parsed.model_dump(by_alias=True, exclude_none=True, mode="json"),
+            parsed.to_dict(),
+        )
+        _assert_known_keys(item, dumped)
+    return _http(status, body)
 
 
-def error(status, message="error"):
-    return _http(status, {"code": 2, "message": message})
+def created(model, body):
+    return ok(model, body, status=201)
 
 
-def identifier(value):
-    return {"value": value}
+def no_content():
+    return _http(204)
 
 
-def network(net_id, name, net_type="NETWORK_TYPE_OVERLAY", segmentation_id=None):
-    net = {
-        "networkResourceId": identifier(net_id),
-        "networkResourceName": name,
-        "subnetId": [],
-        "networkPort": [],
-        "bandwidth": 100,
-        "networkType": net_type,
-        "networkQoS": [],
-        "isShared": False,
-        "operationalState": "ENABLED",
-        "connectedNetworks": [],
+def error(status, reason="internal", detail="error"):
+    problem = {
+        "type": PROBLEMS + reason,
+        "title": "error",
+        "status": status,
+        "detail": detail,
     }
+    return _http(status, problem, "application/problem+json")
+
+
+def network(net_id, name, net_type="NETWORK_TYPE_GENEVE", segmentation_id=None):
+    net = {
+        "networkId": net_id,
+        "networkName": name,
+        "subnetIds": ["a3bae246-4726-4312-bd06-47b80d34795a"],
+        "networkType": net_type,
+        "operationalState": "OPERATIONAL_STATE_ENABLED",
+    }
+    if net_type != "NETWORK_TYPE_GENEVE":
+        net["providerNetwork"] = "mx5p0"
     if segmentation_id is not None:
         net["segmentationId"] = segmentation_id
     return net
 
 
-def flavour(flavour_id, name="small", memory="2048M", cpus=2, disk="10Gi"):
+def flavour(flavour_id=FLAVOUR_ID, name="small", memory="2048M", cpus=2, disk="10Gi"):
     return {
-        "flavourId": identifier(flavour_id),
-        "isPublic": False,
-        "virtualMemory": {"virtualMemSize": {"string": memory}},
+        "flavourId": flavour_id,
+        "flavourName": name,
+        "virtualMemory": {"virtualMemSize": memory},
         "virtualCpu": {"numVirtualCpu": cpus},
         "storageAttributes": [
             {
-                "typeOfStorage": "volume",
-                "sizeOfStorage": {"string": disk},
+                "typeOfStorage": "TYPE_OF_STORAGE_VOLUME",
+                "sizeOfStorage": disk,
                 "isBoot": True,
             }
         ],
-        "virtualNetworkInterface": [],
-        "metadata": {"fields": {FLAVOUR_NAME_KEY: name}},
     }
 
 
-def image(image_id, name, location=None):
-    fields = {"image.kubevim.kubenfv.io/source-url": location} if location else {}
+def image(image_id, name, location="https://images.test/disk.qcow2"):
     return {
-        "softwareImageId": identifier(image_id),
+        "imageId": image_id,
         "name": name,
         "createdAt": "2026-01-01T00:00:00Z",
         "updatedAt": "2026-01-01T00:00:00Z",
-        "size": {"string": "1Gi"},
-        "status": "AVAILABLE",
-        "metadata": {"fields": fields},
+        "size": "1Gi",
+        "status": "IMAGE_STATUS_AVAILABLE",
+        "source": {"http": {"url": location}},
     }
 
 
-def nic(resource_id, net_id=None, mgmt=False, ready=True, ip=None, mac=None):
-    return {
-        "resourceId": identifier(resource_id),
-        "ownerId": identifier("vm-1"),
-        "networkId": identifier(net_id) if net_id else None,
-        "ipAddress": [{"ip": ip}] if ip else [],
-        "typeVirtualNic": "TYPE_VIRTUAL_NIC_BRIDGE",
-        "macAddress": {"mac": mac or "initializing"},
-        "bandwidth": 0,
-        "operationalState": "ENABLED",
-        "metadata": {
-            "fields": {
-                MGMT_KEY: "true" if mgmt else "false",
-                READY_KEY: "true" if ready else "false",
-            }
-        },
+def nic(name, net_id=None, mgmt=False, ready=True, ip=None, mac=None, pci=None):
+    iface = {
+        "name": name,
+        "computeId": VM_ID,
+        "typeVirtualNic": (
+            "TYPE_VIRTUAL_NIC_MASQUERADE"
+            if mgmt
+            else "TYPE_VIRTUAL_NIC_SRIOV" if pci else "TYPE_VIRTUAL_NIC_BRIDGE"
+        ),
+        "operationalState": (
+            "OPERATIONAL_STATE_ENABLED" if ready else "OPERATIONAL_STATE_DISABLED"
+        ),
     }
+    if mgmt:
+        iface["isManagement"] = True
+    if net_id:
+        iface["networkId"] = net_id
+    if ip:
+        iface["ipAddresses"] = [ip]
+    if mac:
+        iface["macAddress"] = mac
+    if pci:
+        iface["hostPciAddress"] = pci
+    return iface
 
 
-def compute(vm_id="vm-1", state="RUNNING", nics=(), reason=None):
-    fields = {"status.vmi.kubevirt.io/phase": "Running"}
-    if reason:
-        fields["status.vmi.kubevirt.io/reason"] = reason
-    return {
-        "computeId": identifier(vm_id),
+def compute(state="COMPUTE_RUNNING_STATE_STARTED", nics=(), detail=None):
+    vm = {
+        "computeId": VM_ID,
         "computeName": "vm",
-        "flavourId": identifier("flavour-1"),
-        "virtualCpu": {},
-        "virtualMemory": {},
-        "virtualNetworkInterface": list(nics),
-        "virtualDisks": [],
-        "vcImageId": identifier("image-1"),
-        "hostId": identifier("node-1"),
-        "operationalState": "ENABLED",
+        "flavourId": FLAVOUR_ID,
+        "imageId": IMAGE_ID,
+        "networkInterfaces": list(nics),
+        "hostId": "node-1",
+        "operationalState": "OPERATIONAL_STATE_ENABLED",
         "runningState": state,
-        "metadata": {"fields": fields},
+        "metadata": {"kubevim.kubenfv.io/vm-name": f"vm-{VM_ID}"},
     }
+    if detail:
+        vm["statusDetail"] = detail
+    return vm
 
 
 def networks(*nets):
-    return ok(PbQueryNetworkResponse, {"queryNetworkResult": list(nets)})
+    return ok(Network, list(nets))
 
 
 def flavours(*items):
-    return ok(PbQueryComputeFlavourResponse, {"flavours": list(items)})
-
-
-def computes(*items):
-    return ok(PbQueryComputeResponse, {"queryResult": list(items)})
+    return ok(Flavour, list(items))
 
 
 class KubevimTestCase(unittest.TestCase):
@@ -233,8 +241,8 @@ class KubevimTestCase(unittest.TestCase):
         return call.args[1], url.path, query, call.kwargs.get("body")
 
 
-class TestQuantity(unittest.TestCase):
-    def test_suffixes(self):
+class TestHelpers(unittest.TestCase):
+    def test_quantity_suffixes(self):
         cases = {
             "1024M": 1024 * 10**6,
             "2G": 2 * 10**9,
@@ -249,34 +257,54 @@ class TestQuantity(unittest.TestCase):
             with self.subTest(quantity=quantity):
                 self.assertEqual(quantity_to_bytes(quantity), expected)
 
-    def test_invalid(self):
+    def test_quantity_invalid(self):
         for quantity in ("", "Gi", "10Xi", "ten"):
             with self.subTest(quantity=quantity):
                 with self.assertRaises(vimconn.VimConnUnexpectedResponse):
                     quantity_to_bytes(quantity)
+
+    def test_split_physical_network(self):
+        cases = {
+            "mx5p0": ("mx5p0", None),
+            "mx5p0/mlx_vf_pf0_vfio": ("mx5p0", "openshift.io/mlx_vf_pf0_vfio"),
+            "mx5p0/example.com/vf": ("mx5p0", "example.com/vf"),
+        }
+        for value, expected in cases.items():
+            with self.subTest(value=value):
+                self.assertEqual(split_physical_network(value), expected)
 
 
 class TestErrorMapping(KubevimTestCase):
     def test_connectivity_ok(self):
         self.respond(flavours())
         self.assertIsNone(self.conn.check_vim_connectivity())
-        self.assertEqual(self.sent(), ("GET", "/vivnfm/v5/flavours", {}, None))
+        self.assertEqual(self.sent(), ("GET", "/flavour/v1/flavours", {}, None))
 
     def test_http_errors(self):
         cases = {
-            400: vimconn.VimConnException,
-            401: vimconn.VimConnAuthException,
-            404: vimconn.VimConnNotFoundException,
-            409: vimconn.VimConnConflictException,
-            500: vimconn.VimConnConnectionException,
-            503: vimconn.VimConnConnectionException,
+            (400, "invalid-filter"): vimconn.VimConnException,
+            (401, "x"): vimconn.VimConnAuthException,
+            (403, "x"): vimconn.VimConnAuthException,
+            (404, "not-found"): vimconn.VimConnNotFoundException,
+            (409, "invalid-state"): vimconn.VimConnConflictException,
+            (422, "validation-failed"): vimconn.VimConnException,
+            (422, "unsupported-field"): vimconn.VimConnNotSupportedException,
+            (501, "not-implemented"): vimconn.VimConnNotSupportedException,
+            (500, "internal"): vimconn.VimConnConnectionException,
+            (503, "backend-unavailable"): vimconn.VimConnConnectionException,
         }
-        for status, exception in cases.items():
-            with self.subTest(status=status):
-                self.respond(error(status))
+        for (status, reason), exception in cases.items():
+            with self.subTest(status=status, reason=reason):
+                self.respond(error(status, reason, detail="the reason"))
                 with self.assertRaises(exception) as ctx:
                     self.conn.check_vim_connectivity()
                 self.assertIs(type(ctx.exception), exception)
+                self.assertIn("the reason", str(ctx.exception))
+
+    def test_error_without_problem_body(self):
+        self.respond(_http(502, None, "text/plain"))
+        with self.assertRaises(vimconn.VimConnConnectionException):
+            self.conn.check_vim_connectivity()
 
     def test_gateway_unreachable(self):
         self.request.side_effect = urllib3.exceptions.MaxRetryError(None, URL)
@@ -402,7 +430,7 @@ class TestAuth(KubevimTestCase):
         self.connect(token_url=TOKEN_URL).check_vim_connectivity()
         self.assertEqual(self.authorization(0), "Bearer t1")
         self.assertEqual(self.authorization(1), "Bearer t2")
-        self.assertEqual(self.sent(1), ("GET", "/vivnfm/v5/flavours", {}, None))
+        self.assertEqual(self.sent(1), ("GET", "/flavour/v1/flavours", {}, None))
 
     def test_rejected_again_raises(self):
         self.idp.side_effect = [token("t1"), token("t2")]
@@ -410,6 +438,13 @@ class TestAuth(KubevimTestCase):
         with self.assertRaises(vimconn.VimConnAuthException):
             self.connect(token_url=TOKEN_URL).check_vim_connectivity()
         self.assertEqual(self.request.call_count, 2)
+
+    def test_missing_scope_is_not_retried(self):
+        self.idp.side_effect = [token("t1")]
+        self.respond(error(403))
+        with self.assertRaises(vimconn.VimConnAuthException):
+            self.connect(token_url=TOKEN_URL).check_vim_connectivity()
+        self.assertEqual(self.request.call_count, 1)
 
     def test_bad_client_credentials(self):
         for status in (400, 401):
@@ -517,376 +552,327 @@ class TestAuth(KubevimTestCase):
 
 
 class TestNewNetwork(KubevimTestCase):
-    def allocate(self, *args, **kwargs):
-        self.respond(
-            ok(PbAllocateNetworkResponse, {"networkData": network("net-1", "n")})
-        )
-        result = self.conn.new_network(*args, **kwargs)
+    def create(self, *args, **kwargs):
+        """Creates a network and returns the network sent to Kube-VIM."""
+        self.respond(created(Network, network(NET_ID, "net")))
+        net_id, extra = self.conn.new_network(*args, **kwargs)
+        self.assertEqual((net_id, extra), (NET_ID, {}))
         method, path, _, body = self.sent()
-        self.assertEqual((method, path), ("POST", "/vivnfm/v5/networks"))
-        self.assertEqual(result, ("net-1", {}))
-        return body
+        self.assertEqual((method, path), ("POST", "/network/v1/networks"))
+        return body["network"]
 
     def test_overlay(self):
-        body = self.allocate(
-            "net-a",
-            "bridge",
-            ip_profile={
-                "ip_version": "IPv4",
-                "subnet_address": "10.0.0.0/24",
-                "gateway_address": "10.0.0.1",
-                "dhcp_enabled": False,
+        ip_profile = {
+            "ip_version": "IPv4",
+            "subnet_address": "10.0.0.0/24",
+            "gateway_address": "10.0.0.1",
+            "dhcp_enabled": True,
+        }
+        net = self.create("net", "bridge", ip_profile=ip_profile, shared=True)
+        self.assertEqual(
+            net,
+            {
+                "networkName": "net",
+                "networkType": "NETWORK_TYPE_GENEVE",
+                "layer3Attributes": [
+                    {
+                        "ipVersion": "IP_VERSION_IPV4",
+                        "cidr": "10.0.0.0/24",
+                        "gatewayIp": "10.0.0.1",
+                        "isDhcpEnabled": True,
+                    }
+                ],
             },
-            shared=True,
         )
-        self.assertEqual(body["networkResourceType"], "NETWORK")
-        self.assertEqual(body["networkResourceName"], "net-a")
-        net = body["typeNetworkData"]
-        self.assertEqual(net["networkType"], "NETWORK_TYPE_OVERLAY")
-        self.assertTrue(net["isShared"])
+
+    def test_ipv6_and_dhcp_default(self):
+        net = self.create(
+            "net",
+            "bridge",
+            ip_profile={"ip_version": "IPv6", "subnet_address": "fd00::/64"},
+        )
         self.assertEqual(
             net["layer3Attributes"],
             [
                 {
-                    "ipVersion": "IPV4",
-                    "gatewayIp": {"ip": "10.0.0.1"},
-                    "cidr": {"cidr": "10.0.0.0/24"},
-                    "isDhcpEnabled": False,
+                    "ipVersion": "IP_VERSION_IPV6",
+                    "cidr": "fd00::/64",
+                    "isDhcpEnabled": True,
                 }
             ],
         )
-        self.assertNotIn("segmentationId", net)
-
-    def test_ipv6_and_dhcp_default(self):
-        body = self.allocate(
-            "net-a",
-            "bridge",
-            ip_profile={"ip_version": "IPv6", "subnet_address": "fd00::/64"},
-        )
-        subnet = body["typeNetworkData"]["layer3Attributes"][0]
-        self.assertEqual(subnet["ipVersion"], "IPV6")
-        self.assertTrue(subnet["isDhcpEnabled"])
 
     def test_gateway_none(self):
-        body = self.allocate(
-            "net-a",
+        net = self.create(
+            "net",
             "bridge",
             ip_profile={"subnet_address": "10.0.0.0/24", "gateway_address": None},
         )
-        self.assertNotIn("gatewayIp", body["typeNetworkData"]["layer3Attributes"][0])
+        self.assertNotIn("gatewayIp", net["layer3Attributes"][0])
 
     def test_dhcp_disabled_as_string(self):
-        body = self.allocate(
-            "net-a",
+        net = self.create(
+            "net",
             "bridge",
             ip_profile={"subnet_address": "10.0.0.0/24", "dhcp_enabled": "false"},
         )
-        self.assertFalse(
-            body["typeNetworkData"]["layer3Attributes"][0]["isDhcpEnabled"]
-        )
+        self.assertFalse(net["layer3Attributes"][0]["isDhcpEnabled"])
 
     def test_random_subnet_without_ip_profile(self):
-        with patch("osm_rovim_kubevim.vimconn_kubevim.random.SystemRandom") as rnd:
-            rnd.return_value.randint.return_value = 42
-            body = self.allocate("net-a", "bridge")
-        subnet = body["typeNetworkData"]["layer3Attributes"][0]
-        self.assertEqual(subnet["cidr"], {"cidr": "192.168.42.0/24"})
-        self.assertEqual(subnet["ipVersion"], "IPV4")
-        rnd.return_value.randint.assert_called_once_with(0, 255)
+        net = self.create("net", "bridge")
+        cidr = net["layer3Attributes"][0]["cidr"]
+        self.assertRegex(cidr, r"^192\.168\.\d{1,3}\.0/24$")
 
-    def test_underlay_vlan(self):
-        body = self.allocate(
-            "net-a",
+    def test_vlan(self):
+        net = self.create(
+            "net",
             "data",
             ip_profile={"subnet_address": "10.0.0.0/24"},
             provider_network_profile={
-                "physical-network": "physnet1",
-                "segmentation-id": 100,
+                "physical-network": "mx5p0",
+                "segmentation-id": "100",
             },
         )
-        net = body["typeNetworkData"]
-        self.assertEqual(net["networkType"], "NETWORK_TYPE_UNDERLAY")
-        self.assertEqual(net["providerNetwork"], "physnet1")
-        self.assertEqual(net["segmentationId"], "100")
+        self.assertEqual(net["networkType"], "NETWORK_TYPE_VLAN")
+        self.assertEqual(net["providerNetwork"], "mx5p0")
+        self.assertEqual(net["segmentationId"], 100)
+        self.assertNotIn("sriov", net)
         self.assertEqual(len(net["layer3Attributes"]), 1)
 
-    def test_underlay_flat_alternative_keys(self):
-        body = self.allocate(
-            "net-a",
-            "ptp",
+    def test_flat_alternative_keys(self):
+        net = self.create(
+            "net",
+            "data",
             provider_network_profile={
-                "provider_network": "physnet2",
+                "provider_network": "mx5p0",
                 "segmentation_id": 0,
             },
         )
-        net = body["typeNetworkData"]
-        self.assertEqual(net["providerNetwork"], "physnet2")
+        self.assertEqual(net["networkType"], "NETWORK_TYPE_FLAT")
         self.assertNotIn("segmentationId", net)
 
-    def test_sriov(self):
-        body = self.allocate(
-            "net-a",
+    def test_vlan_with_pool_takes_both_interface_kinds(self):
+        net = self.create(
+            "net",
             "data",
+            ip_profile={"subnet_address": "10.0.0.0/24"},
             provider_network_profile={
-                "network-type": "sriov",
-                "physical-network": "sriov-pool",
-                "segmentation-id": 200,
+                "physical-network": "mx5p0/mlx_vf_pf0_vfio",
+                "segmentation-id": "100",
             },
         )
-        net = body["typeNetworkData"]
-        self.assertEqual(net["networkType"], "NETWORK_TYPE_SRIOV")
-        self.assertEqual(net["providerNetwork"], "sriov-pool")
-        self.assertEqual(net["segmentationId"], "200")
+        self.assertEqual(net["providerNetwork"], "mx5p0")
+        self.assertEqual(net["sriov"], {"pool": "openshift.io/mlx_vf_pf0_vfio"})
+        self.assertEqual(len(net["layer3Attributes"]), 1)
+
+    def test_sriov_network_type_has_no_subnet(self):
+        net = self.create(
+            "net",
+            "data",
+            provider_network_profile={
+                "physical-network": "mx5p0/mlx_vf_pf0_vfio",
+                "network-type": "sriov",
+            },
+        )
+        self.assertEqual(net["networkType"], "NETWORK_TYPE_FLAT")
+        self.assertEqual(net["sriov"], {"pool": "openshift.io/mlx_vf_pf0_vfio"})
         self.assertNotIn("layer3Attributes", net)
 
-    def test_data_network_without_provider_profile(self):
-        with self.assertRaises(vimconn.VimConnNotSupportedException):
-            self.conn.new_network("net-a", "data")
+    def test_rejected_profiles(self):
+        cases = {
+            "no profile": ("data", None),
+            "sriov without pool": (
+                "data",
+                {"physical-network": "mx5p0", "network-type": "sriov"},
+            ),
+            "no physical network": ("data", {"segmentation-id": "100"}),
+        }
+        for name, (net_type, profile) in cases.items():
+            with self.subTest(name):
+                with self.assertRaises(vimconn.VimConnNotSupportedException):
+                    self.conn.new_network(
+                        "net", net_type, provider_network_profile=profile
+                    )
         self.request.assert_not_called()
 
-    def test_empty_response(self):
-        self.respond(ok(PbAllocateNetworkResponse, {}))
-        with self.assertRaises(vimconn.VimConnUnexpectedResponse):
-            self.conn.new_network("net-a", "bridge")
-
     def test_api_error(self):
-        self.respond(error(409))
-        with self.assertRaises(vimconn.VimConnConflictException):
-            self.conn.new_network("net-a", "bridge")
+        self.respond(error(422, "validation-failed"))
+        with self.assertRaises(vimconn.VimConnException):
+            self.conn.new_network("net", "bridge")
 
 
 class TestNetworkQueries(KubevimTestCase):
     def test_list_without_filter(self):
-        self.respond(networks(network("net-1", "a"), network("net-2", "b")))
-        result = self.conn.get_network_list()
-        self.assertEqual([n["id"] for n in result], ["net-1", "net-2"])
-        self.assertEqual(
-            self.sent(),
-            (
-                "GET",
-                "/vivnfm/v5/networks",
-                {"networkResourceType": "NETWORK", "queryNetworkFilter.value": ""},
-                None,
-            ),
-        )
+        self.respond(networks(network(NET_ID, "net-a")))
+        nets = self.conn.get_network_list()
+        self.assertEqual(self.sent(), ("GET", "/network/v1/networks", {}, None))
+        self.assertEqual(len(nets), 1)
+        self.assertEqual(nets[0]["id"], NET_ID)
+        self.assertEqual(nets[0]["name"], "net-a")
+        self.assertEqual(nets[0]["status"], "ACTIVE")
+        self.assertFalse(nets[0]["shared"])
 
     def test_list_filters(self):
         self.respond(networks())
+        self.conn.get_network_list({"name": "it's mgmt", "id": NET_ID, "shared": False})
+        _, _, query, _ = self.sent()
         self.assertEqual(
-            self.conn.get_network_list({"name": "a", "id": "net-1", "shared": True}), []
-        )
-        self.assertEqual(
-            self.sent()[2]["queryNetworkFilter.value"],
-            "filter=(eq,networkResourceName,a);(eq,networkResourceId/value,net-1);"
-            "(eq,isShared,true)",
+            query["filter"], f"(eq,networkName,'it''s mgmt');(eq,networkId,'{NET_ID}')"
         )
 
-    def test_list_empty_result(self):
-        self.respond(ok(PbQueryNetworkResponse, {}))
-        self.assertEqual(self.conn.get_network_list(), [])
+    def test_list_shared_is_empty(self):
+        self.assertEqual(self.conn.get_network_list({"shared": True}), [])
+        self.request.assert_not_called()
 
     def test_list_unsupported_filter(self):
         with self.assertRaises(vimconn.VimConnNotSupportedException):
             self.conn.get_network_list({"tenant_id": "x"})
-        self.request.assert_not_called()
 
     def test_network_types(self):
         cases = [
-            (network("n", "a"), "vxlan", 0),
-            (network("n", "a", "NETWORK_TYPE_UNDERLAY", "100"), "vlan", 100),
-            (network("n", "a", "NETWORK_TYPE_UNDERLAY", "0"), "flat", None),
-            (network("n", "a", "NETWORK_TYPE_UNDERLAY"), "flat", None),
-            (network("n", "a", "NETWORK_TYPE_SRIOV", "200"), "SR-IOV", 200),
-            (network("n", "a", "NETWORK_TYPE_SRIOV"), "SR-IOV", None),
+            (network(NET_ID, "a"), "vxlan", 0),
+            (network(NET_ID, "b", "NETWORK_TYPE_VLAN", 100), "vlan", 100),
+            (network(NET_ID, "c", "NETWORK_TYPE_FLAT"), "flat", None),
         ]
-        for net, net_type, segmentation_id in cases:
-            with self.subTest(net_type=net_type, segmentation_id=segmentation_id):
-                self.respond(networks(net))
-                result = self.conn.get_network("n")
-                self.assertEqual(result["network_type"], net_type)
-                self.assertEqual(result.get("segmentation_id"), segmentation_id)
+        for body, net_type, segmentation_id in cases:
+            with self.subTest(net_type=net_type):
+                self.respond(networks(body))
+                net = self.conn.get_network_list()[0]
+                self.assertEqual(net["network_type"], net_type)
+                self.assertEqual(net.get("segmentation_id"), segmentation_id)
 
     def test_get_network(self):
-        net = network("net-1", "a", "NETWORK_TYPE_UNDERLAY", "100")
-        net["providerNetwork"] = "physnet1"
-        self.respond(networks(net))
-        result = self.conn.get_network("net-1")
-        self.assertEqual(result["id"], "net-1")
-        self.assertEqual(result["name"], "a")
-        self.assertEqual(result["status"], "ACTIVE")
-        self.assertFalse(result["shared"])
-        self.assertEqual(result["providerNetwork"], "physnet1")
-        for key in ("networkResourceId", "networkType", "connectedNetworks"):
-            self.assertNotIn(key, result)
+        self.respond(ok(Network, network(NET_ID, "net-a")))
+        net = self.conn.get_network(NET_ID)
         self.assertEqual(
-            self.sent()[2]["queryNetworkFilter.value"],
-            "filter=(eq,networkResourceId/value,net-1)",
+            self.sent(), ("GET", f"/network/v1/networks/{NET_ID}", {}, None)
         )
+        self.assertEqual(net["id"], NET_ID)
+        self.assertNotIn("networkId", net)
 
     def test_get_network_disabled(self):
-        net = network("net-1", "a")
-        net["operationalState"] = "DISABLED"
-        self.respond(networks(net))
-        self.assertEqual(self.conn.get_network("net-1")["status"], "INACTIVE")
+        body = network(NET_ID, "net-a")
+        body["operationalState"] = "OPERATIONAL_STATE_DISABLED"
+        self.respond(ok(Network, body))
+        self.assertEqual(self.conn.get_network(NET_ID)["status"], "INACTIVE")
 
     def test_get_network_not_found(self):
-        self.respond(networks())
+        self.respond(error(404, "not-found"))
         with self.assertRaises(vimconn.VimConnNotFoundException):
-            self.conn.get_network("net-1")
-
-    def test_get_network_ambiguous(self):
-        self.respond(networks(network("net-1", "a"), network("net-1", "b")))
-        with self.assertRaises(vimconn.VimConnUnexpectedResponse):
-            self.conn.get_network("net-1")
-
-    def test_get_network_api_error(self):
-        self.respond(error(500))
-        with self.assertRaises(vimconn.VimConnConnectionException):
-            self.conn.get_network("net-1")
+            self.conn.get_network(NET_ID)
 
     def test_delete_network(self):
-        self.respond(
-            ok(PbTerminateNetworkResponse, {"networkResourceId": identifier("net-1")})
+        self.respond(no_content())
+        self.assertEqual(self.conn.delete_network(NET_ID), NET_ID)
+        self.assertEqual(
+            self.sent(), ("DELETE", f"/network/v1/networks/{NET_ID}", {}, None)
         )
-        self.assertEqual(self.conn.delete_network("net-1"), "net-1")
-        self.assertEqual(self.sent()[:2], ("DELETE", "/vivnfm/v5/networks/net-1"))
 
     def test_delete_network_not_found(self):
-        self.respond(error(404))
+        self.respond(error(404, "not-found"))
         with self.assertRaises(vimconn.VimConnNotFoundException):
-            self.conn.delete_network("net-1")
+            self.conn.delete_network(NET_ID)
 
     def test_refresh_nets_status(self):
-        self.respond(networks(network("net-1", "a")))
-        result = self.conn.refresh_nets_status(["net-1", "net-gone"])
-        self.assertEqual(result["net-1"]["status"], "ACTIVE")
-        self.assertEqual(yaml.safe_load(result["net-1"]["vim_info"])["id"], "net-1")
-        self.assertEqual(result["net-gone"], {"status": "DELETED"})
+        self.respond(networks(network(NET_ID, "net-a")))
+        res = self.conn.refresh_nets_status([NET_ID, NET_ID_2])
+        self.assertEqual(res[NET_ID]["status"], "ACTIVE")
+        self.assertEqual(yaml.safe_load(res[NET_ID]["vim_info"])["name"], "net-a")
+        self.assertEqual(res[NET_ID_2], {"status": "DELETED"})
 
     def test_refresh_nets_status_unreachable(self):
-        self.request.side_effect = urllib3.exceptions.MaxRetryError(None, URL)
-        result = self.conn.refresh_nets_status(["net-1", "net-2"])
-        for net_id in ("net-1", "net-2"):
-            self.assertEqual(result[net_id]["status"], "VIM_ERROR")
-            self.assertIn("Max retries", result[net_id]["error_msg"])
+        self.respond(error(503, "backend-unavailable"))
+        res = self.conn.refresh_nets_status([NET_ID])
+        self.assertEqual(res[NET_ID]["status"], "VIM_ERROR")
 
 
 class TestFlavors(KubevimTestCase):
     def test_get_flavor(self):
-        self.respond(flavours(flavour("flavour-1")))
+        self.respond(ok(Flavour, flavour()))
         self.assertEqual(
-            self.conn.get_flavor("flavour-1"),
-            {"id": "flavour-1", "name": "small", "ram": 2048, "vcpus": 2, "disk": 10},
+            self.conn.get_flavor(FLAVOUR_ID),
+            {"id": FLAVOUR_ID, "name": "small", "ram": 2048, "vcpus": 2, "disk": 10},
         )
         self.assertEqual(
-            self.sent(),
-            (
-                "GET",
-                "/vivnfm/v5/flavours",
-                {
-                    "queryComputeFlavourFilter.value": "filter=(eq,flavourId/value,flavour-1)"
-                },
-                None,
-            ),
+            self.sent(), ("GET", f"/flavour/v1/flavours/{FLAVOUR_ID}", {}, None)
         )
 
     def test_get_flavor_canonical_quantities(self):
-        # Kubernetes returns quantities in canonical form, e.g. 2000M as 2G
-        cases = [("2G", "20Gi", 2000, 20), ("4096M", "1Ti", 4096, 1024)]
-        for memory, disk, ram, disk_gb in cases:
-            with self.subTest(memory=memory, disk=disk):
-                self.respond(flavours(flavour("f", memory=memory, disk=disk)))
-                result = self.conn.get_flavor(flavor_id="f")
-                self.assertEqual((result["ram"], result["disk"]), (ram, disk_gb))
+        self.respond(ok(Flavour, flavour(memory="2G", disk="10Gi")))
+        flavor = self.conn.get_flavor(FLAVOUR_ID)
+        self.assertEqual((flavor["ram"], flavor["disk"]), (2000, 10))
 
     def test_get_flavor_by_name_not_supported(self):
         with self.assertRaises(vimconn.VimConnNotSupportedException):
             self.conn.get_flavor(flavor_name="small")
-        self.request.assert_not_called()
 
     def test_get_flavor_not_found(self):
-        self.respond(flavours())
+        self.respond(error(404, "not-found"))
         with self.assertRaises(vimconn.VimConnNotFoundException):
-            self.conn.get_flavor("flavour-1")
+            self.conn.get_flavor(FLAVOUR_ID)
 
-    def test_get_flavor_api_error(self):
-        self.respond(error(500))
-        with self.assertRaises(vimconn.VimConnConnectionException):
-            self.conn.get_flavor("flavour-1")
-
-    def test_get_flavor_unexpected_responses(self):
-        no_name = flavour("f")
-        no_name["metadata"] = {"fields": {}}
-        no_boot = flavour("f")
-        no_boot["storageAttributes"][0]["isBoot"] = False
-        no_id = flavour("f")
-        del no_id["flavourId"]
-        cases = {
-            "ambiguous": flavours(flavour("f"), flavour("f")),
-            "no name": flavours(no_name),
-            "no boot storage": flavours(no_boot),
-            "no id": flavours(no_id),
-        }
-        for case, response in cases.items():
-            with self.subTest(case=case):
-                self.respond(response)
-                with self.assertRaises(vimconn.VimConnUnexpectedResponse):
-                    self.conn.get_flavor("f")
+    def test_get_flavor_without_boot_storage(self):
+        body = flavour()
+        body["storageAttributes"][0]["isBoot"] = False
+        self.respond(ok(Flavour, body))
+        with self.assertRaises(vimconn.VimConnUnexpectedResponse):
+            self.conn.get_flavor(FLAVOUR_ID)
 
     def test_new_flavor(self):
-        self.respond(
-            ok(PbCreateComputeFlavourResponse, {"flavourId": identifier("flavour-1")})
-        )
-        result = self.conn.new_flavor(
+        self.respond(created(Flavour, flavour()))
+        flavor_id = self.conn.new_flavor(
             {"name": "small", "ram": 2048, "vcpus": 2, "disk": 10}
         )
-        self.assertEqual(result, "flavour-1")
+        self.assertEqual(flavor_id, FLAVOUR_ID)
         method, path, _, body = self.sent()
-        self.assertEqual((method, path), ("POST", "/vivnfm/v5/flavours"))
+        self.assertEqual((method, path), ("POST", "/flavour/v1/flavours"))
         self.assertEqual(
             body,
             {
                 "flavour": {
-                    "isPublic": True,
-                    "virtualMemory": {"virtualMemSize": {"string": "2048M"}},
+                    "flavourName": "small",
+                    "virtualMemory": {"virtualMemSize": "2048M"},
                     "virtualCpu": {"numVirtualCpu": 2},
                     "storageAttributes": [
                         {
-                            "typeOfStorage": "volume",
-                            "sizeOfStorage": {"string": "10Gi"},
+                            "typeOfStorage": "TYPE_OF_STORAGE_VOLUME",
+                            "sizeOfStorage": "10Gi",
                             "isBoot": True,
                         }
                     ],
-                },
-                "metaData": {"fields": {FLAVOUR_NAME_KEY: "small"}},
+                }
             },
         )
 
     def test_new_flavor_api_error(self):
-        self.respond(error(409))
-        with self.assertRaises(vimconn.VimConnConflictException):
+        self.respond(error(422, "unsupported-field"))
+        with self.assertRaises(vimconn.VimConnNotSupportedException):
             self.conn.new_flavor({"name": "small", "ram": 2048, "vcpus": 2, "disk": 10})
 
     def test_delete_flavor(self):
-        self.respond(_http(200, {}))
-        self.assertEqual(self.conn.delete_flavor("flavour-1"), "flavour-1")
-        self.assertEqual(self.sent()[:2], ("DELETE", "/vivnfm/v5/flavours/flavour-1"))
+        self.respond(no_content())
+        self.assertEqual(self.conn.delete_flavor(FLAVOUR_ID), FLAVOUR_ID)
+        self.assertEqual(
+            self.sent(), ("DELETE", f"/flavour/v1/flavours/{FLAVOUR_ID}", {}, None)
+        )
 
     def test_delete_flavor_not_found(self):
-        self.respond(error(404))
+        self.respond(error(404, "not-found"))
         with self.assertRaises(vimconn.VimConnNotFoundException):
-            self.conn.delete_flavor("flavour-1")
+            self.conn.delete_flavor(FLAVOUR_ID)
 
     def test_get_flavor_id_from_data(self):
-        self.respond(flavours(flavour("flavour-1"), flavour("flavour-2")))
-        result = self.conn.get_flavor_id_from_data(
+        self.respond(flavours(flavour()))
+        flavor_id = self.conn.get_flavor_id_from_data(
             {"ram": 2048, "vcpus": 2, "disk": 10}
         )
-        self.assertEqual(result, "flavour-1")
+        self.assertEqual(flavor_id, FLAVOUR_ID)
+        _, path, query, _ = self.sent()
+        self.assertEqual(path, "/flavour/v1/flavours")
         self.assertEqual(
-            self.sent()[2]["queryComputeFlavourFilter.value"],
-            "filter=(eq,virtualMemory/virtualMemSize,2048M);"
-            "(eq,virtualCpu/numVirtualCpu,2);(eq,storageAttributes/sizeOfStorage,10Gi)",
+            query["filter"],
+            "(eq,virtualMemory/virtualMemSize,2048M);(eq,virtualCpu/numVirtualCpu,2);"
+            "(eq,storageAttributes/sizeOfStorage,10Gi)",
         )
 
     def test_get_flavor_id_from_data_not_found(self):
@@ -894,322 +880,275 @@ class TestFlavors(KubevimTestCase):
         with self.assertRaises(vimconn.VimConnNotFoundException):
             self.conn.get_flavor_id_from_data({"ram": 2048, "vcpus": 2, "disk": 10})
 
-    def test_get_flavor_id_from_data_without_id(self):
-        no_id = flavour("f")
-        del no_id["flavourId"]
-        self.respond(flavours(no_id))
-        with self.assertRaises(vimconn.VimConnUnexpectedResponse):
-            self.conn.get_flavor_id_from_data({"ram": 2048, "vcpus": 2, "disk": 10})
-
-    def test_get_flavor_id_from_data_api_error(self):
-        self.respond(error(500))
-        with self.assertRaises(vimconn.VimConnConnectionException):
-            self.conn.get_flavor_id_from_data({"ram": 2048, "vcpus": 2, "disk": 10})
-
 
 class TestImages(KubevimTestCase):
     def test_list(self):
-        self.respond(
-            ok(
-                PbQueryImagesResponse,
-                {
-                    "softwareImagesInformation": [
-                        image(
-                            "image-1", "cirros", location="https://example.com/c.img"
-                        ),
-                        image("image-2", "ubuntu"),
-                    ]
-                },
-            )
-        )
-        result = self.conn.get_image_list()
-        self.assertEqual([i["id"] for i in result], ["image-1", "image-2"])
-        self.assertEqual(result[0]["name"], "cirros")
-        self.assertEqual(result[0]["location"], "https://example.com/c.img")
-        self.assertEqual(result[1]["location"], "None")
+        self.respond(ok(Image, [image(IMAGE_ID, "cirros")]))
+        images = self.conn.get_image_list()
+        self.assertEqual(self.sent(), ("GET", "/image/v1/images", {}, None))
+        self.assertEqual(len(images), 1)
+        self.assertEqual(images[0]["id"], IMAGE_ID)
+        self.assertEqual(images[0]["name"], "cirros")
+        self.assertEqual(images[0]["location"], "https://images.test/disk.qcow2")
+        self.assertEqual(images[0]["status"], "IMAGE_STATUS_AVAILABLE")
         self.assertEqual(
-            self.sent(),
-            ("GET", "/vivnfm/v5/images", {"imageQueryFilter.value": ""}, None),
+            images[0]["source"], {"http": {"url": "https://images.test/disk.qcow2"}}
         )
 
     def test_filters(self):
-        cases = [
-            ({"id": "image-1"}, "filter=(eq,softwareImageId/value,image-1)"),
-            ({"name": "cirros"}, "filter=(eq,name,cirros)"),
-            ({}, ""),
-            (None, ""),
-        ]
-        for filter_dict, query in cases:
-            with self.subTest(filter_dict=filter_dict):
-                self.respond(ok(PbQueryImagesResponse, {}))
-                self.assertEqual(self.conn.get_image_list(filter_dict), [])
-                self.assertEqual(self.sent()[2]["imageQueryFilter.value"], query)
+        self.respond(ok(Image, []))
+        self.conn.get_image_list(
+            {
+                "id": IMAGE_ID,
+                "name": "cirros 0.6",
+                "location": "https://images.test/a.img",
+            }
+        )
+        _, _, query, _ = self.sent()
+        self.assertEqual(
+            query["filter"],
+            f"(eq,imageId,'{IMAGE_ID}');(eq,name,'cirros 0.6');"
+            "(eq,source/http/url,'https://images.test/a.img')",
+        )
 
-    def test_unsupported_filters(self):
-        for key in ("location", "checksum"):
-            with self.subTest(key=key):
-                with self.assertRaises(vimconn.VimConnNotImplemented):
-                    self.conn.get_image_list({key: "x"})
-        self.request.assert_not_called()
+    def test_checksum_not_implemented(self):
+        with self.assertRaises(vimconn.VimConnNotImplemented):
+            self.conn.get_image_list({"checksum": "abc"})
 
     def test_api_error(self):
-        self.respond(error(500))
-        with self.assertRaises(vimconn.VimConnConnectionException):
-            self.conn.get_image_list()
+        self.respond(error(400, "invalid-filter"))
+        with self.assertRaises(vimconn.VimConnException):
+            self.conn.get_image_list({"name": "cirros"})
 
 
 class TestNewVminstance(KubevimTestCase):
     def create(self, net_list, response_nics, **kwargs):
-        self.respond(
-            ok(
-                PbAllocateComputeResponse,
-                {"computeData": compute("vm-1", "STARTING", response_nics)},
-            )
+        self.respond(created(Compute, compute(nics=response_nics)))
+        args = dict(
+            name="vm",
+            description="",
+            start=True,
+            image_id=IMAGE_ID,
+            flavor_id=FLAVOUR_ID,
+            affinity_group_list=[],
+            net_list=net_list,
         )
-        result = self.conn.new_vminstance(
-            "vm", "description", True, "image-1", "flavour-1", [], net_list, **kwargs
-        )
+        args.update(kwargs)
+        vm_id, extra = self.conn.new_vminstance(**args)
+        self.assertEqual((vm_id, extra), (VM_ID, {}))
         method, path, _, body = self.sent()
-        self.assertEqual((method, path), ("POST", "/vivnfm/v5/compute"))
-        self.assertEqual(result, ("vm-1", {}))
+        self.assertEqual((method, path), ("POST", "/compute/v1/computes"))
         return body
 
     def test_interfaces(self):
         net_list = [
-            {"name": "eth1", "type": "virtual", "net_id": "net-1"},
             {
-                "name": "eth2",
-                "type": "SR-IOV",
-                "net_id": "net-2",
+                "net_id": NET_ID,
+                "type": "virtual",
                 "ip_address": "10.0.0.5",
-                "mac_address": "52:54:00:00:00:02",
-                "bw": 2,
+                "mac_address": "02:00:00:00:00:01",
+                "bw": 1,
             },
+            {"net_id": NET_ID, "type": "virtual"},
+            {"net_id": NET_ID_2, "type": "SR-IOV", "ip_address": "10.1.0.5"},
         ]
         body = self.create(
             net_list,
-            [nic("default", mgmt=True), nic("nic-1", "net-1"), nic("nic-2", "net-2")],
+            [
+                nic("default", mgmt=True),
+                nic("nic0", NET_ID),
+                nic("nic1", NET_ID),
+                nic("nic2", NET_ID_2, pci="0000:b3:00.2"),
+            ],
         )
-        self.assertEqual(body["computeName"], "vm")
-        self.assertEqual(body["computeFlavourId"], identifier("flavour-1"))
-        self.assertEqual(body["vcImageId"], identifier("image-1"))
         self.assertEqual(
-            body["interfaceData"],
+            body["compute"],
+            {"computeName": "vm", "flavourId": FLAVOUR_ID, "imageId": IMAGE_ID},
+        )
+        self.assertEqual(
+            body["networkInterfaces"],
             [
                 {
-                    "networkId": identifier("net-1"),
+                    "name": "nic0",
+                    "networkId": NET_ID,
                     "typeVirtualNic": "TYPE_VIRTUAL_NIC_BRIDGE",
-                    "metadata": {
-                        "fields": {
-                            "compute.kubevim.kubenfv.io/network.subnet.assignment": "random"
-                        }
-                    },
+                    "ipAssignment": "IP_ASSIGNMENT_STATIC",
+                    "ipAddresses": ["10.0.0.5"],
+                    "macAddress": "02:00:00:00:00:01",
                 },
                 {
-                    "networkId": identifier("net-2"),
+                    "name": "nic1",
+                    "networkId": NET_ID,
+                    "typeVirtualNic": "TYPE_VIRTUAL_NIC_BRIDGE",
+                },
+                {
+                    "name": "nic2",
+                    "networkId": NET_ID_2,
                     "typeVirtualNic": "TYPE_VIRTUAL_NIC_SRIOV",
-                    "bandwidth": 2000,
+                    "ipAssignment": "IP_ASSIGNMENT_NONE",
                 },
             ],
         )
-        self.assertEqual(
-            body["interfaceIPAM"],
-            [
-                {"networkId": identifier("net-1")},
-                {
-                    "networkId": identifier("net-2"),
-                    "ipAddress": {"ip": "10.0.0.5"},
-                    "macAddress": {"mac": "52:54:00:00:00:02"},
-                },
-            ],
-        )
-        self.assertNotIn("userData", body)
-        self.assertEqual([n["vim_id"] for n in net_list], ["nic-1", "nic-2"])
+        self.assertNotIn("start", body)
+        self.assertEqual([net["vim_id"] for net in net_list], ["nic0", "nic1", "nic2"])
 
     def test_vf_types(self):
-        for nic_type in ("VF", "VFnotShared"):
+        for nic_type in ("SR-IOV", "VF", "VFnotShared"):
             with self.subTest(nic_type=nic_type):
                 body = self.create(
-                    [{"type": nic_type, "net_id": "net-1"}], [nic("nic-1", "net-1")]
+                    [{"net_id": NET_ID, "type": nic_type}], [nic("nic0", NET_ID)]
                 )
                 self.assertEqual(
-                    body["interfaceData"][0]["typeVirtualNic"], "TYPE_VIRTUAL_NIC_SRIOV"
+                    body["networkInterfaces"][0]["typeVirtualNic"],
+                    "TYPE_VIRTUAL_NIC_SRIOV",
                 )
 
-    def test_user_data(self):
-        body = self.create(
-            [{"type": "virtual", "net_id": "net-1"}],
-            [nic("nic-1", "net-1")],
-            cloud_config={"key-pairs": ["ssh-rsa AAAA test"]},
+    def test_user_data_and_start(self):
+        with patch.object(
+            vimconnector, "_create_user_data", return_value=(None, "#cloud-config\n")
+        ):
+            body = self.create([], [], cloud_config={"users": []}, start=False)
+        self.assertEqual(
+            body["userData"],
+            {
+                "content": "#cloud-config\n",
+                "method": "USER_DATA_TRANSPORTATION_METHOD_NO_CLOUD",
+            },
         )
-        self.assertEqual(body["userData"]["method"], "NO_CLOUD")
-        self.assertIn("ssh-rsa AAAA test", body["userData"]["content"])
+        self.assertIs(body["start"], False)
 
     def test_rejected_interfaces(self):
-        cases = {
-            "duplicate network": [
-                {"type": "virtual", "net_id": "net-1"},
-                {"type": "virtual", "net_id": "net-1"},
-            ],
-            "PF": [{"type": "PF", "net_id": "net-1"}],
-            "PCI-PASSTHROUGH": [{"type": "PCI-PASSTHROUGH", "net_id": "net-1"}],
-            "unknown type": [{"type": "bogus", "net_id": "net-1"}],
-        }
-        for case, net_list in cases.items():
-            with self.subTest(case=case):
+        for nic_type in ("PCI-PASSTHROUGH", "PF", "unknown"):
+            with self.subTest(nic_type=nic_type):
                 with self.assertRaises(vimconn.VimConnNotSupportedException):
                     self.conn.new_vminstance(
-                        "vm", "", True, "image-1", "flavour-1", [], net_list
+                        "vm",
+                        "",
+                        True,
+                        IMAGE_ID,
+                        FLAVOUR_ID,
+                        [],
+                        [{"net_id": NET_ID, "type": nic_type}],
                     )
         self.request.assert_not_called()
 
     def test_api_error(self):
-        self.respond(error(404, "flavour not found"))
-        with self.assertRaises(vimconn.VimConnNotFoundException):
-            self.conn.new_vminstance(
-                "vm",
-                "",
-                True,
-                "image-1",
-                "flavour-1",
-                [],
-                [{"type": "virtual", "net_id": "net-1"}],
-            )
+        self.respond(error(409, "invalid-state", "software image is not available"))
+        with self.assertRaises(vimconn.VimConnConflictException) as ctx:
+            self.conn.new_vminstance("vm", "", True, IMAGE_ID, FLAVOUR_ID, [], [])
+        self.assertIn("software image is not available", str(ctx.exception))
 
 
 class TestVminstance(KubevimTestCase):
     def test_get_vminstance(self):
-        self.respond(computes(compute("vm-1", nics=[nic("default", mgmt=True)])))
-        result = self.conn.get_vminstance("vm-1")
-        self.assertEqual(result["computeId"], identifier("vm-1"))
-        self.assertEqual(result["runningState"], "RUNNING")
+        self.respond(ok(Compute, compute(nics=[nic("nic0", NET_ID, ip="10.0.0.5")])))
+        vm = self.conn.get_vminstance(VM_ID)
         self.assertEqual(
-            self.sent(),
-            (
-                "GET",
-                "/vivnfm/v5/compute",
-                {"queryComputeFilter.value": "filter=(eq,computeId/value,vm-1)"},
-                None,
-            ),
+            self.sent(), ("GET", f"/compute/v1/computes/{VM_ID}", {}, None)
+        )
+        self.assertEqual(vm["computeId"], VM_ID)
+        self.assertEqual(vm["runningState"], "COMPUTE_RUNNING_STATE_STARTED")
+        self.assertEqual(
+            vm["networkInterfaces"][0]["typeVirtualNic"], "TYPE_VIRTUAL_NIC_BRIDGE"
         )
 
     def test_get_vminstance_not_found(self):
-        self.respond(computes())
+        self.respond(error(404, "not-found"))
         with self.assertRaises(vimconn.VimConnNotFoundException):
-            self.conn.get_vminstance("vm-1")
-
-    def test_get_vminstance_ambiguous(self):
-        self.respond(computes(compute("vm-1"), compute("vm-1")))
-        with self.assertRaises(vimconn.VimConnUnexpectedResponse):
-            self.conn.get_vminstance("vm-1")
+            self.conn.get_vminstance(VM_ID)
 
     def test_delete_vminstance(self):
-        self.respond(ok(PbTerminateComputeResponse, {"computeId": identifier("vm-1")}))
-        self.assertEqual(self.conn.delete_vminstance("vm-1"), "vm-1")
-        self.assertEqual(self.sent()[:2], ("DELETE", "/vivnfm/v5/compute/vm-1"))
-
-    def test_delete_vminstance_id_mismatch(self):
-        self.respond(ok(PbTerminateComputeResponse, {"computeId": identifier("vm-2")}))
-        with self.assertRaises(vimconn.VimConnUnexpectedResponse):
-            self.conn.delete_vminstance("vm-1")
+        self.respond(no_content())
+        self.assertEqual(self.conn.delete_vminstance(VM_ID), VM_ID)
+        self.assertEqual(
+            self.sent(), ("DELETE", f"/compute/v1/computes/{VM_ID}", {}, None)
+        )
 
     def test_delete_vminstance_not_found(self):
-        self.respond(error(404))
+        self.respond(error(404, "not-found"))
         with self.assertRaises(vimconn.VimConnNotFoundException):
-            self.conn.delete_vminstance("vm-1")
+            self.conn.delete_vminstance(VM_ID)
 
     def test_action_not_supported(self):
         with self.assertRaises(vimconn.VimConnNotSupportedException):
-            self.conn.action_vminstance("vm-1", {"start": None})
-        self.request.assert_not_called()
+            self.conn.action_vminstance(VM_ID, {"start": None})
 
 
 class TestRefreshVmsStatus(KubevimTestCase):
-    def test_active(self):
-        nics = [
-            nic("default", mgmt=True, ip="10.244.0.7", mac="52:54:00:00:00:01"),
-            nic("nic-1", "net-1", ip="192.168.1.10", mac="52:54:00:00:00:02"),
-        ]
-        self.respond(computes(compute("vm-1", "RUNNING", nics)))
-        result = self.conn.refresh_vms_status(["vm-1"])["vm-1"]
-        self.assertEqual(result["status"], "ACTIVE")
-        self.assertEqual(result["error_msg"], "")
-        self.assertEqual(
-            yaml.safe_load(result["vim_info"])["computeId"], identifier("vm-1")
-        )
-        mgmt, data = result["interfaces"]
-        self.assertEqual(mgmt["vim_net_id"], "management")
-        self.assertEqual(mgmt["vim_interface_id"], "default")
-        self.assertEqual(mgmt["ip_address"], "10.244.0.7")
-        self.assertEqual(data["vim_net_id"], "net-1")
-        self.assertEqual(data["vim_interface_id"], "nic-1")
-        self.assertEqual(data["ip_address"], "192.168.1.10")
-        self.assertEqual(data["mac_address"], "52:54:00:00:00:02")
-        self.assertEqual(data["compute_node"], "node-1")
+    def refresh(self, body):
+        self.respond(ok(Compute, body))
+        return self.conn.refresh_vms_status([VM_ID])[VM_ID]
 
-    def test_interface_without_ip(self):
-        self.respond(computes(compute("vm-1", "RUNNING", [nic("nic-1", "net-1")])))
-        result = self.conn.refresh_vms_status(["vm-1"])["vm-1"]
-        self.assertIsNone(result["interfaces"][0]["ip_address"])
+    def test_active(self):
+        res = self.refresh(
+            compute(
+                nics=[
+                    nic("default", mgmt=True, ip="10.16.0.5", mac="02:00:00:00:00:00"),
+                    nic("nic0", NET_ID, ip="10.0.0.5", mac="02:00:00:00:00:01"),
+                    nic("nic1", NET_ID_2, mac="02:00:00:00:00:02", pci="0000:b3:00.2"),
+                ]
+            )
+        )
+        self.assertEqual(res["status"], "ACTIVE")
+        self.assertEqual(yaml.safe_load(res["vim_info"])["computeId"], VM_ID)
+        mgmt, bridge, vf = res["interfaces"]
+        self.assertEqual(mgmt["vim_net_id"], "management")
+        self.assertEqual(
+            {k: v for k, v in bridge.items() if k != "vim_info"},
+            {
+                "mac_address": "02:00:00:00:00:01",
+                "ip_address": "10.0.0.5",
+                "vim_interface_id": "nic0",
+                "vim_net_id": NET_ID,
+                "compute_node": "node-1",
+            },
+        )
+        self.assertEqual(vf["pci"], "0000:b3:00.2")
+        self.assertIsNone(vf["ip_address"])
 
     def test_interface_not_ready_is_build(self):
-        nics = [nic("default", mgmt=True), nic("nic-1", "net-1", ready=False)]
-        self.respond(computes(compute("vm-1", "RUNNING", nics)))
-        result = self.conn.refresh_vms_status(["vm-1"])["vm-1"]
-        self.assertEqual(result["status"], "BUILD")
-        self.assertEqual(
-            [i["vim_interface_id"] for i in result["interfaces"]], ["default"]
-        )
+        res = self.refresh(compute(nics=[nic("nic0", NET_ID, ready=False)]))
+        self.assertEqual(res["status"], "BUILD")
+        self.assertEqual(res["interfaces"], [])
 
     def test_running_states(self):
         cases = {
-            "STARTING": "BUILD",
-            "PAUSED": "PAUSED",
-            "SUSPENDED": "SUSPENDED",
-            "STOPPED": "INACTIVE",
-            "TERMINATING": "INACTIVE",
+            "COMPUTE_RUNNING_STATE_STARTED": "ACTIVE",
+            "COMPUTE_RUNNING_STATE_MIGRATING": "ACTIVE",
+            "COMPUTE_RUNNING_STATE_PAUSED": "PAUSED",
+            "COMPUTE_RUNNING_STATE_STARTING": "BUILD",
+            "COMPUTE_RUNNING_STATE_STOPPING": "INACTIVE",
+            "COMPUTE_RUNNING_STATE_STOPPED": "INACTIVE",
+            "COMPUTE_RUNNING_STATE_TERMINATING": "INACTIVE",
         }
         for state, status in cases.items():
             with self.subTest(state=state):
-                self.respond(computes(compute("vm-1", state)))
-                result = self.conn.refresh_vms_status(["vm-1"])["vm-1"]
-                self.assertEqual(result["status"], status)
-                self.assertEqual(result["error_msg"], "")
+                self.assertEqual(self.refresh(compute(state=state))["status"], status)
 
     def test_unknown_state(self):
-        self.respond(computes(compute("vm-1", "UNKNOWN")))
-        result = self.conn.refresh_vms_status(["vm-1"])["vm-1"]
-        self.assertEqual(result["status"], "OTHER")
-        self.assertEqual(result["error_msg"], "status is UNKNOWN")
+        res = self.refresh(compute(state="COMPUTE_RUNNING_STATE_UNSPECIFIED"))
+        self.assertEqual(res["status"], "OTHER")
+        self.assertIn("UNSPECIFIED", res["error_msg"])
 
     def test_failed(self):
-        self.respond(computes(compute("vm-1", "FAILED", reason="Unschedulable")))
-        result = self.conn.refresh_vms_status(["vm-1"])
-        self.assertEqual(
-            result["vm-1"], {"status": "ERROR", "error_msg": "Unschedulable"}
+        res = self.refresh(
+            compute(state="COMPUTE_RUNNING_STATE_FAILED", detail="ErrImagePull")
         )
+        self.assertEqual(res, {"status": "ERROR", "error_msg": "ErrImagePull"})
 
-    def test_failed_without_reason(self):
-        self.respond(computes(compute("vm-1", "FAILED")))
-        result = self.conn.refresh_vms_status(["vm-1"])
-        self.assertEqual(result["vm-1"], {"status": "ERROR", "error_msg": "unknown"})
+    def test_failed_without_detail(self):
+        res = self.refresh(compute(state="COMPUTE_RUNNING_STATE_FAILED"))
+        self.assertEqual(res["error_msg"], "unknown")
 
     def test_deleted(self):
-        self.respond(computes())
-        result = self.conn.refresh_vms_status(["vm-1"])
-        self.assertEqual(result["vm-1"]["status"], "DELETED")
+        self.respond(error(404, "not-found"))
+        res = self.conn.refresh_vms_status([VM_ID])
+        self.assertEqual(res[VM_ID]["status"], "DELETED")
 
     def test_unreachable(self):
-        self.request.side_effect = urllib3.exceptions.MaxRetryError(None, URL)
-        result = self.conn.refresh_vms_status(["vm-1"])
-        self.assertEqual(result["vm-1"]["status"], "VIM_ERROR")
-        self.assertIn("Max retries", result["vm-1"]["error_msg"])
-
-    def test_several_vms(self):
-        self.respond(computes(compute("vm-1")), computes())
-        result = self.conn.refresh_vms_status(["vm-1", "vm-2"])
-        self.assertEqual(result["vm-1"]["status"], "ACTIVE")
-        self.assertEqual(result["vm-2"]["status"], "DELETED")
+        self.respond(error(503, "backend-unavailable"))
+        res = self.conn.refresh_vms_status([VM_ID])
+        self.assertEqual(res[VM_ID]["status"], "VIM_ERROR")
 
 
 class TestInjectUserKey(unittest.TestCase):

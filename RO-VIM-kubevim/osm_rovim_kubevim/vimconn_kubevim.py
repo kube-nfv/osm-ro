@@ -18,8 +18,9 @@
 osm-ro VIM connector plugin for Kube-VIM.
 
 It implements the VimConnector interface defined by RO-plugin on top of the
-Kube-VIM Vi-Vnfm (ETSI GS NFV-IFA 006) REST gateway, accessed through the
-``kubevim-vivnfm-client`` package. The VIM account ``url`` is the gateway URL.
+Kube-VIM v1 REST API (ETSI GS NFV-SOL 013 conventions over the IFA 005/006
+information model), accessed through the ``kubevim-client`` package. The VIM
+account ``url`` is the gateway URL.
 
 VIM account ``config`` keys:
     management_network_name: existing Kube-VIM network that VLDs marked
@@ -37,6 +38,16 @@ VIM account ``config`` keys:
     ca_cert: CA bundle for the gateway and the token endpoint (NG-RO writes
         ca_cert_content to this file)
     insecure: skip TLS certificate verification; exclusive with ca_cert
+
+VLD ``provider-network`` instantiation parameters:
+    physical-network: the Kube-OVN provider network, optionally followed by
+        ``/<pool>``, the SR-IOV virtual function pool on its uplink (a pool
+        without a domain gets ``openshift.io/``), e.g. ``mx5p0/mlx_vf_pf0_vfio``.
+        A network with a pool takes SR-IOV interfaces, and bridged ones when it
+        also has a subnet
+    segmentation-id: the VLAN ID; absent or 0 gives a FLAT network
+    network-type: ``sriov`` creates the network without a subnet, so it takes
+        SR-IOV interfaces only; it needs a pool
 """
 
 import base64
@@ -48,53 +59,43 @@ import time
 from typing import Any, List
 from urllib.parse import quote_plus
 
-from kubevim_vivnfm_client.api import vi_vnfm_api
-from kubevim_vivnfm_client.api_client import ApiClient
-from kubevim_vivnfm_client.configuration import Configuration
-from kubevim_vivnfm_client.exceptions import (
+from kubevim_client.api.compute_service_api import ComputeServiceApi
+from kubevim_client.api.flavour_service_api import FlavourServiceApi
+from kubevim_client.api.image_service_api import ImageServiceApi
+from kubevim_client.api.network_service_api import NetworkServiceApi
+from kubevim_client.api_client import ApiClient
+from kubevim_client.configuration import Configuration
+from kubevim_client.exceptions import (
     ApiException,
-    BadRequestException,
     ConflictException,
+    ForbiddenException,
     NotFoundException,
     UnauthorizedException,
 )
-from kubevim_vivnfm_client.models.identifier import Identifier
-from kubevim_vivnfm_client.models.ip_address import IPAddress
-from kubevim_vivnfm_client.models.ip_subnet_cidr import IPSubnetCIDR
-from kubevim_vivnfm_client.models.ip_version import IPVersion
-from kubevim_vivnfm_client.models.mac_address import MacAddress
-from kubevim_vivnfm_client.models.metadata import Metadata
-from kubevim_vivnfm_client.models.network_resource_type import NetworkResourceType
-from kubevim_vivnfm_client.models.network_subnet_data import NetworkSubnetData
-from kubevim_vivnfm_client.models.network_type import NetworkType
-from kubevim_vivnfm_client.models.operational_state import OperationalState
-from kubevim_vivnfm_client.models.pb_allocate_compute_request import (
-    PbAllocateComputeRequest,
+from kubevim_client.models.compute import Compute
+from kubevim_client.models.compute_running_state import ComputeRunningState
+from kubevim_client.models.create_compute_request import CreateComputeRequest
+from kubevim_client.models.create_flavour_request import CreateFlavourRequest
+from kubevim_client.models.create_network_request import CreateNetworkRequest
+from kubevim_client.models.flavour import Flavour
+from kubevim_client.models.image_source_http import ImageSourceHttp
+from kubevim_client.models.ip_assignment import IpAssignment
+from kubevim_client.models.ip_version import IpVersion
+from kubevim_client.models.network import Network
+from kubevim_client.models.network_interface_data import NetworkInterfaceData
+from kubevim_client.models.network_type import NetworkType
+from kubevim_client.models.operational_state import OperationalState
+from kubevim_client.models.sriov_settings import SriovSettings
+from kubevim_client.models.subnet_data import SubnetData
+from kubevim_client.models.type_of_storage import TypeOfStorage
+from kubevim_client.models.type_virtual_nic import TypeVirtualNic
+from kubevim_client.models.user_data import UserData
+from kubevim_client.models.user_data_transportation_method import (
+    UserDataTransportationMethod,
 )
-from kubevim_vivnfm_client.models.pb_allocate_network_request import (
-    PbAllocateNetworkRequest,
-)
-from kubevim_vivnfm_client.models.pb_create_compute_flavour_request import (
-    PbCreateComputeFlavourRequest,
-)
-from kubevim_vivnfm_client.models.resource_quantity import ResourceQuantity
-from kubevim_vivnfm_client.models.type_virtual_nic import TypeVirtualNic
-from kubevim_vivnfm_client.models.user_data import UserData
-from kubevim_vivnfm_client.models.user_data_user_data_transportation_method import (
-    UserDataUserDataTransportationMethod,
-)
-from kubevim_vivnfm_client.models.virtual_compute_flavour import VirtualComputeFlavour
-from kubevim_vivnfm_client.models.virtual_cpu_data import VirtualCpuData
-from kubevim_vivnfm_client.models.virtual_memory_data import VirtualMemoryData
-from kubevim_vivnfm_client.models.virtual_network import VirtualNetwork
-from kubevim_vivnfm_client.models.virtual_network_data import VirtualNetworkData
-from kubevim_vivnfm_client.models.virtual_network_interface_data import (
-    VirtualNetworkInterfaceData,
-)
-from kubevim_vivnfm_client.models.virtual_network_interface_ipam import (
-    VirtualNetworkInterfaceIPAM,
-)
-from kubevim_vivnfm_client.models.virtual_storage_data import VirtualStorageData
+from kubevim_client.models.virtual_cpu_data import VirtualCpuData
+from kubevim_client.models.virtual_memory_data import VirtualMemoryData
+from kubevim_client.models.virtual_storage_data import VirtualStorageData
 from osm_ro_plugin import vimconn
 import urllib3
 import yaml
@@ -103,43 +104,36 @@ import yaml
 __author__ = "Dmytro Malovanyi"
 __date__ = "2024-12-20"
 
+# A pool name without a domain belongs to the SR-IOV network operator's default domain
+DEFAULT_POOL_DOMAIN = "openshift.io/"
+# ProblemDetails type of a request field Kube-VIM does not support
+UNSUPPORTED_FIELD_PROBLEM = "https://kubevim.kubenfv.io/problems/unsupported-field"
 
-def network_from_virtual_network_response(net: VirtualNetwork):
-    res = {}
-    res["id"] = net.network_resource_id.value
-    res["name"] = net.network_resource_name
+
+def network_from_kubevim(net: Network):
+    res = {"id": net.network_id, "name": net.network_name}
     state = net.operational_state
-    if state == OperationalState.ENABLED:
+    if state == OperationalState.OPERATIONAL_STATE_ENABLED:
         res["status"] = "ACTIVE"
-    elif state == OperationalState.DISABLED:
+    elif state == OperationalState.OPERATIONAL_STATE_DISABLED:
         res["status"] = "INACTIVE"
     else:
         res["status"] = "OTHER"
         res["error_msg"] = f"Undefined state {state}"
     net_type = net.network_type
-    if net_type == "NETWORK_TYPE_OVERLAY":
+    if net_type == NetworkType.NETWORK_TYPE_GENEVE:
         res["network_type"] = "vxlan"
-        # NOTE: kube-vim use ovn as a network soltion, while
-        # ovn (might) use vxlan for the overlays it is lacks of the
-        # specific "segmentation_id" for the network.
+        # Kube-OVN overlays have no segmentation ID of their own.
         res["segmentation_id"] = 0
-    elif net_type == "NETWORK_TYPE_UNDERLAY":
-        if net.segmentation_id is None or net.segmentation_id == "0":
-            res["network_type"] = "flat"
-        else:
-            res["network_type"] = "vlan"
-            res["segmentation_id"] = int(net.segmentation_id)
-    elif net_type == "NETWORK_TYPE_SRIOV":
-        res["network_type"] = "SR-IOV"
-        if net.segmentation_id and int(net.segmentation_id) != 0:
-            res["segmentation_id"] = int(net.segmentation_id)
-    res["shared"] = net.is_shared
-    res = {**res, **net.to_dict()}
-    del res["connectedNetworks"]
-    del res["networkResourceId"]
-    del res["networkResourceName"]
-    del res["networkType"]
-    del res["operationalState"]
+    elif net_type == NetworkType.NETWORK_TYPE_VLAN:
+        res["network_type"] = "vlan"
+        res["segmentation_id"] = net.segmentation_id
+    elif net_type == NetworkType.NETWORK_TYPE_FLAT:
+        res["network_type"] = "flat"
+    res["shared"] = False
+    res = {**res, **convert_enums(net.model_dump(by_alias=True, exclude_none=True))}
+    for key in ("networkId", "networkName", "networkType", "operationalState"):
+        res.pop(key, None)
     return res
 
 
@@ -151,6 +145,21 @@ def convert_enums(obj: Any) -> Any:
     elif isinstance(obj, enum.Enum):
         return obj.value
     return obj
+
+
+def filter_value(value) -> str:
+    """Quotes a value for a SOL 013 filter expression."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def split_physical_network(physical_network: str):
+    """Splits '<provider network>[/<pool>]' into the provider network and the pool or None."""
+    provider, _, pool = physical_network.partition("/")
+    if not pool:
+        return provider, None
+    if "/" not in pool:
+        pool = DEFAULT_POOL_DOMAIN + pool
+    return provider, pool
 
 
 QUANTITY_SUFFIXES = {
@@ -279,9 +288,8 @@ class vimconnector(vimconn.VimConnector):
     def check_vim_connectivity(self):
         self.logger.debug("Check VIM connectivity")
         with self._api_client() as api_client:
-            api_instance = vi_vnfm_api.ViVnfmApi(api_client)
             try:
-                api_instance.vi_vnfm_query_compute_flavour()
+                FlavourServiceApi(api_client).list_flavours()
             except (ApiException, urllib3.exceptions.HTTPError) as ex:
                 self._format_exception(ex)
 
@@ -301,17 +309,8 @@ class vimconnector(vimconn.VimConnector):
             shared,
             provider_network_profile,
         )
-        req = PbAllocateNetworkRequest(
-            networkResourceType=NetworkResourceType("NETWORK")
-        )
-
-        req.network_resource_name = net_name
-        bandwidth = 100  # Mbps
-        net = VirtualNetworkData(bandwidth=bandwidth)
-        net.is_shared = shared
         if not ip_profile:
             ip_profile = {}
-
         if not ip_profile.get("subnet_address"):
             # Fake subnet is required
             subnet_rand = random.SystemRandom().randint(0, 255)
@@ -319,26 +318,25 @@ class vimconnector(vimconn.VimConnector):
         if "ip_version" not in ip_profile:
             ip_profile["ip_version"] = "IPv4"
 
-        subnet = NetworkSubnetData()
-        if ip_profile["ip_version"] == "IPv4":
-            subnet.ip_version = IPVersion("IPV4")
-        elif ip_profile["ip_version"] == "IPv6":
-            subnet.ip_version = IPVersion("IPV6")
+        subnet = SubnetData(
+            ipVersion=(
+                IpVersion.IP_VERSION_IPV6
+                if ip_profile["ip_version"] == "IPv6"
+                else IpVersion.IP_VERSION_IPV4
+            ),
+            cidr=ip_profile["subnet_address"],
+        )
         if ip_profile.get("gateway_address"):
-            subnet.gateway_ip = IPAddress(ip=ip_profile["gateway_address"])
-        subnet.cidr = IPSubnetCIDR(cidr=ip_profile["subnet_address"])
-
+            subnet.gateway_ip = ip_profile["gateway_address"]
         if "dhcp_enabled" in ip_profile:
-            subnet.is_dhcp_enabled = (
-                False
-                if ip_profile["dhcp_enabled"] == "false"
+            subnet.is_dhcp_enabled = not (
+                ip_profile["dhcp_enabled"] == "false"
                 or ip_profile["dhcp_enabled"] is False
-                else True
             )
         else:
             subnet.is_dhcp_enabled = True
 
-        # TODO: Add dhcp pool
+        net = Network(networkName=net_name, networkType=NetworkType.NETWORK_TYPE_GENEVE)
         if net_type in ["data", "ptp"] or provider_network_profile:
             if provider_network_profile is None:
                 raise vimconn.VimConnNotSupportedException(
@@ -347,117 +345,84 @@ class vimconnector(vimconn.VimConnector):
             physical_network = provider_network_profile.get(
                 "physical-network"
             ) or provider_network_profile.get("provider_network")
+            if not physical_network:
+                raise vimconn.VimConnNotSupportedException(
+                    "provider network profile has no physical-network"
+                )
             seg_id = provider_network_profile.get(
                 "segmentation-id"
             ) or provider_network_profile.get("segmentation_id")
-            if provider_network_profile.get("network-type") == "sriov":
-                net.network_type = NetworkType("NETWORK_TYPE_SRIOV")
-                net.provider_network = physical_network
-                if seg_id and str(seg_id) != "0":
-                    net.segmentation_id = str(seg_id)
+            net.provider_network, pool = split_physical_network(physical_network)
+            if seg_id and str(seg_id) != "0":
+                net.network_type = NetworkType.NETWORK_TYPE_VLAN
+                net.segmentation_id = int(seg_id)
             else:
-                net.network_type = NetworkType("NETWORK_TYPE_UNDERLAY")
-                net.provider_network = physical_network
-                if seg_id and str(seg_id) != "0":
-                    net.segmentation_id = str(seg_id)
-                if subnet:
-                    net.layer3_attributes = [subnet]
-        else:
-            net.network_type = NetworkType("NETWORK_TYPE_OVERLAY")
-            if subnet:
+                net.network_type = NetworkType.NETWORK_TYPE_FLAT
+            if pool:
+                net.sriov = SriovSettings(pool=pool)
+            if provider_network_profile.get("network-type") == "sriov":
+                if not pool:
+                    raise vimconn.VimConnNotSupportedException(
+                        "network-type sriov needs physical-network <provider network>/<pool>"
+                    )
+            else:
                 net.layer3_attributes = [subnet]
+        else:
+            net.layer3_attributes = [subnet]
 
-        req.type_network_data = net
         with self._api_client() as api_client:
-            api_instance = vi_vnfm_api.ViVnfmApi(api_client)
             try:
-                api_response = (
-                    api_instance.vi_vnfm_allocate_virtualised_network_resource(body=req)
+                created = NetworkServiceApi(api_client).create_network(
+                    CreateNetworkRequest(network=net)
                 )
-                if api_response is None or api_response.network_data is None:
+                if created is None or not created.network_id:
                     raise vimconn.VimConnUnexpectedResponse("received empty response")
-                net_id = api_response.network_data.network_resource_id.value
-                return net_id, {}
+                return created.network_id, {}
             except (ApiException, urllib3.exceptions.HTTPError) as ex:
                 self._format_exception(ex)
 
     def get_network_list(self, filter_dict=None):
         self.logger.debug("Get Networks. Filter dict: %s", filter_dict)
-        with self._api_client() as api_client:
-            api_instance = vi_vnfm_api.ViVnfmApi(api_client)
-            query_filter = ""
-            if filter_dict:
-                query_filter = "filter="
-                for filter_name, filter_val in filter_dict.items():
-                    if filter_name == "name":
-                        query_filter += f"(eq,networkResourceName,{filter_val});"
-                        continue
-                    if filter_name == "id":
-                        query_filter += f"(eq,networkResourceId/value,{filter_val});"
-                        continue
-                    if filter_name == "shared":
-                        query_filter += (
-                            f'(eq,isShared,{"true" if filter_val else "false"});'
-                        )
-                        continue
-                    raise vimconn.VimConnNotSupportedException(
-                        f"get network filter {filter_name} is not supported"
-                    )
-                query_filter = query_filter[:-1]
-            try:
-                api_response = api_instance.vi_vnfm_query_virtualised_network_resource(
-                    "NETWORK", query_filter
+        exprs = []
+        for filter_name, filter_val in (filter_dict or {}).items():
+            if filter_name == "name":
+                exprs.append(f"(eq,networkName,{filter_value(filter_val)})")
+            elif filter_name == "id":
+                exprs.append(f"(eq,networkId,{filter_value(filter_val)})")
+            elif filter_name == "shared":
+                # Kube-VIM networks are never shared.
+                if filter_val:
+                    return []
+            else:
+                raise vimconn.VimConnNotSupportedException(
+                    f"get network filter {filter_name} is not supported"
                 )
-                res = []
-                if api_response is None:
-                    raise vimconn.VimConnUnexpectedResponse("response can't be empty")
-                # query_network_result can be None when no networks match the filter
-                if api_response.query_network_result is not None:
-                    for net in api_response.query_network_result:
-                        res.append(network_from_virtual_network_response(net))
-                return res
+        with self._api_client() as api_client:
+            try:
+                nets = NetworkServiceApi(api_client).list_networks(
+                    filter=";".join(exprs) or None
+                )
+                return [network_from_kubevim(net) for net in nets or []]
             except (ApiException, urllib3.exceptions.HTTPError) as ex:
                 self._format_exception(ex)
 
     def get_network(self, net_id):
         self.logger.debug("Network %s get request", net_id)
         with self._api_client() as api_client:
-            api_instance = vi_vnfm_api.ViVnfmApi(api_client)
-            query_filter = f"filter=(eq,networkResourceId/value,{net_id})"
             try:
-                api_response = api_instance.vi_vnfm_query_virtualised_network_resource(
-                    "NETWORK", query_filter
-                )
-                if api_response is None:
+                net = NetworkServiceApi(api_client).get_network(net_id)
+                if net is None:
                     raise vimconn.VimConnUnexpectedResponse("received empty response")
-                # query_network_result can be None when no networks match the filter
-                if (
-                    api_response.query_network_result is None
-                    or len(api_response.query_network_result) == 0
-                ):
-                    raise vimconn.VimConnNotFoundException(
-                        f"network with id {net_id} not found"
-                    )
-                net_data_lst = api_response.query_network_result
-                if len(net_data_lst) > 1:
-                    raise vimconn.VimConnUnexpectedResponse(
-                        f"More that one network found by the id {net_id}"
-                    )
-                net_data = net_data_lst[0]
-                return network_from_virtual_network_response(net_data)
+                return network_from_kubevim(net)
             except (ApiException, urllib3.exceptions.HTTPError) as ex:
                 self._format_exception(ex)
 
     def delete_network(self, net_id, created_items=None):
+        self.logger.debug("Network %s delete request", net_id)
         with self._api_client() as api_client:
-            api_instance = vi_vnfm_api.ViVnfmApi(api_client)
             try:
-                api_response = (
-                    api_instance.vi_vnfm_terminate_virtualised_network_resource(net_id)
-                )
-                if api_response is None or api_response.network_resource_id is None:
-                    raise vimconn.VimConnUnexpectedResponse("received empty response")
-                return api_response.network_resource_id.value
+                NetworkServiceApi(api_client).delete_network(net_id)
+                return net_id
             except (ApiException, urllib3.exceptions.HTTPError) as ex:
                 self._format_exception(ex)
 
@@ -505,192 +470,131 @@ class vimconnector(vimconn.VimConnector):
                 "Get flavor by name is not supported"
             )
         with self._api_client() as api_client:
-            api_instance = vi_vnfm_api.ViVnfmApi(api_client)
-            query_filter = f"filter=(eq,flavourId/value,{flavor_id})"
             try:
-                api_response = api_instance.vi_vnfm_query_compute_flavour(
-                    query_compute_flavour_filter_value=query_filter
-                )
-                # flavours can be None when no flavours match the filter
-                if (
-                    api_response is None
-                    or api_response.flavours is None
-                    or len(api_response.flavours) == 0
-                ):
-                    raise vimconn.VimConnNotFoundException(
-                        f"failed to find flavor with id: {flavor_id}"
-                    )
-                flavors = api_response.flavours
-                if len(flavors) > 1:
-                    raise vimconn.VimConnUnexpectedResponse(
-                        f"more that one flavor found with id: {flavor_id}"
-                    )
-                flavor = flavors[0]
-                if flavor.flavour_id is None:
-                    raise vimconn.VimConnUnexpectedResponse(
-                        "flavor id can't be empty in response"
-                    )
-                rsp_flavor_id = flavor.flavour_id.value
-
-                flavNameAnn = "flavour.kubevim.kubenfv.io/attached-name"
-                if (
-                    flavor.metadata is None
-                    or flavor.metadata.fields is None
-                    or flavNameAnn not in flavor.metadata.fields
-                ):
-                    raise vimconn.VimConnUnexpectedResponse(
-                        f"flavor missing metadata fields: {flavor_id}"
-                    )
-
-                boot_storage = [s for s in flavor.storage_attributes or [] if s.is_boot]
-                if not boot_storage:
-                    raise vimconn.VimConnUnexpectedResponse(
-                        f"flavor missing boot storage: {flavor_id}"
-                    )
-
-                # Same units new_flavor writes: ram in MB (M), disk in GiB (Gi)
-                resp = {
-                    "id": rsp_flavor_id,
-                    "name": flavor.metadata.fields[flavNameAnn],
-                    "ram": round(
-                        quantity_to_bytes(flavor.virtual_memory.virtual_mem_size.string)
-                        / 10**6
-                    ),
-                    "vcpus": flavor.virtual_cpu.num_virtual_cpu,
-                    "disk": round(
-                        quantity_to_bytes(boot_storage[0].size_of_storage.string)
-                        / 2**30
-                    ),
-                }
-                return resp
+                flavor = FlavourServiceApi(api_client).get_flavour(flavor_id)
             except (ApiException, urllib3.exceptions.HTTPError) as e:
                 self._format_exception(e)
+        if flavor is None or not flavor.flavour_id:
+            raise vimconn.VimConnUnexpectedResponse(
+                "flavor id can't be empty in response"
+            )
+        boot_storage = [s for s in flavor.storage_attributes or [] if s.is_boot]
+        if not boot_storage:
+            raise vimconn.VimConnUnexpectedResponse(
+                f"flavor missing boot storage: {flavor_id}"
+            )
+        # Same units new_flavor writes: ram in MB (M), disk in GiB (Gi)
+        return {
+            "id": flavor.flavour_id,
+            "name": flavor.flavour_name,
+            "ram": round(
+                quantity_to_bytes(flavor.virtual_memory.virtual_mem_size) / 10**6
+            ),
+            "vcpus": flavor.virtual_cpu.num_virtual_cpu,
+            "disk": round(quantity_to_bytes(boot_storage[0].size_of_storage) / 2**30),
+        }
 
     def new_flavor(self, flavor_data):
         self.logger.debug("new flavour creation with data %s requested", flavor_data)
-        with self._api_client() as api_client:
-            api_instance = vi_vnfm_api.ViVnfmApi(api_client=api_client)
-
-            mem = VirtualMemoryData(
-                virtualMemSize=ResourceQuantity(string=f'{flavor_data["ram"]}M')
-            )
-            cpu = VirtualCpuData(numVirtualCpu=flavor_data["vcpus"])
-            storage = [
+        flavor = Flavour(
+            flavourName=flavor_data["name"],
+            virtualMemory=VirtualMemoryData(virtualMemSize=f'{flavor_data["ram"]}M'),
+            virtualCpu=VirtualCpuData(numVirtualCpu=flavor_data["vcpus"]),
+            storageAttributes=[
                 VirtualStorageData(
-                    typeOfStorage="volume",
-                    sizeOfStorage=ResourceQuantity(string=f'{flavor_data["disk"]}Gi'),
+                    typeOfStorage=TypeOfStorage.TYPE_OF_STORAGE_VOLUME,
+                    sizeOfStorage=f'{flavor_data["disk"]}Gi',
                     isBoot=True,
                 )
-            ]
-
-            flavor = VirtualComputeFlavour(
-                virtualMemory=mem, virtualCpu=cpu, storageAttributes=storage
-            )
-            metadata = Metadata(
-                fields={"flavour.kubevim.kubenfv.io/attached-name": flavor_data["name"]}
-            )
-            body = PbCreateComputeFlavourRequest(flavour=flavor, metaData=metadata)
+            ],
+        )
+        with self._api_client() as api_client:
             try:
-                api_response = api_instance.vi_vnfm_create_compute_flavour(body)
-                flavor_id = api_response.flavour_id
-                if flavor_id is None or flavor_id.value is None:
+                created = FlavourServiceApi(api_client).create_flavour(
+                    CreateFlavourRequest(flavour=flavor)
+                )
+                if created is None or not created.flavour_id:
                     raise vimconn.VimConnUnexpectedResponse(
                         "flavor_id in flavor creation response can't be empty"
                     )
-                flavor_id = flavor_id.value
-                return flavor_id
+                return created.flavour_id
             except (ApiException, urllib3.exceptions.HTTPError) as e:
                 self._format_exception(e)
 
     def delete_flavor(self, flavor_id):
         self.logger.debug("Flavour %s delete request", flavor_id)
         with self._api_client() as api_client:
-            api_instance = vi_vnfm_api.ViVnfmApi(api_client)
             try:
-                api_instance.vi_vnfm_delete_compute_flavour(
-                    compute_flavour_id_value=flavor_id
-                )
+                FlavourServiceApi(api_client).delete_flavour(flavor_id)
                 return flavor_id
             except (ApiException, urllib3.exceptions.HTTPError) as ex:
                 self._format_exception(ex)
 
     def get_flavor_id_from_data(self, flavor_dict):
+        query_filter = (
+            f'(eq,virtualMemory/virtualMemSize,{flavor_dict["ram"]}M);'
+            f'(eq,virtualCpu/numVirtualCpu,{flavor_dict["vcpus"]});'
+            f'(eq,storageAttributes/sizeOfStorage,{flavor_dict["disk"]}Gi)'
+        )
         with self._api_client() as api_client:
-            api_instance = vi_vnfm_api.ViVnfmApi(api_client)
-            query_filter = f'filter=(eq,virtualMemory/virtualMemSize,{flavor_dict["ram"]}M);(eq,virtualCpu/numVirtualCpu,{flavor_dict["vcpus"]});(eq,storageAttributes/sizeOfStorage,{flavor_dict["disk"]}Gi)'
             try:
-                api_response = api_instance.vi_vnfm_query_compute_flavour(
-                    query_compute_flavour_filter_value=query_filter
+                flavors = FlavourServiceApi(api_client).list_flavours(
+                    filter=query_filter
                 )
-                if api_response.flavours is None or len(api_response.flavours) == 0:
-                    raise vimconn.VimConnNotFoundException(
-                        "flavor with ram={}  cpu={} disk={} {} not found".format(
-                            flavor_dict["ram"],
-                            flavor_dict["vcpus"],
-                            flavor_dict["disk"],
-                            "and extended" if flavor_dict.get("extended") else "",
-                        )
-                    )
-                flavor = api_response.flavours[0]
-                if flavor.flavour_id is None or flavor.flavour_id.value is None:
-                    raise vimconn.VimConnUnexpectedResponse(
-                        "flavor_id can't be empty in flavor query response"
-                    )
-                return flavor.flavour_id.value
             except (ApiException, urllib3.exceptions.HTTPError) as e:
                 self._format_exception(e)
+        if not flavors:
+            raise vimconn.VimConnNotFoundException(
+                "flavor with ram={}  cpu={} disk={} {} not found".format(
+                    flavor_dict["ram"],
+                    flavor_dict["vcpus"],
+                    flavor_dict["disk"],
+                    "and extended" if flavor_dict.get("extended") else "",
+                )
+            )
+        if not flavors[0].flavour_id:
+            raise vimconn.VimConnUnexpectedResponse(
+                "flavor_id can't be empty in flavor query response"
+            )
+        return flavors[0].flavour_id
 
     def get_image_list(self, filter_dict={}):
-        img_filter = ""
-        if filter_dict is not None and len(filter_dict) != 0:
-            img_filter = "filter="
+        exprs = []
         for filter_name, filter_val in (filter_dict or {}).items():
             if filter_name == "id":
-                img_filter += f"(eq,softwareImageId/value,{filter_val});"
+                exprs.append(f"(eq,imageId,{filter_value(filter_val)})")
             elif filter_name == "name":
-                img_filter += f"(eq,name,{filter_val});"
+                exprs.append(f"(eq,name,{filter_value(filter_val)})")
             elif filter_name == "location":
-                raise vimconn.VimConnNotImplemented(
-                    "list images by the location is not supported yet"
-                )
+                exprs.append(f"(eq,source/http/url,{filter_value(filter_val)})")
             elif filter_name == "checksum":
                 raise vimconn.VimConnNotImplemented(
                     "list images by the checksum is not supported yet"
                 )
-        # remove trailing ;
-        img_filter = img_filter[:-1]
+        img_filter = ";".join(exprs) or None
         self.logger.debug(
             "Image list request: %s. Filter query: %s", filter_dict, img_filter
         )
         with self._api_client() as api_client:
-            api_instance = vi_vnfm_api.ViVnfmApi(api_client)
             try:
-                api_response = api_instance.vi_vnfm_query_images(img_filter)
-                resp = []
-                if api_response is None:
-                    raise vimconn.VimConnUnexpectedResponse("received empty response")
-                # software_images_information can be None when no images match the filter
-                if api_response.software_images_information is None:
-                    return resp
-                for img in api_response.software_images_information:
-                    imgId = img.software_image_id.value
-                    img_dict = img.to_dict()
-                    img_dict["id"] = imgId
-                    img_dict["name"] = img.name
-                    img_dict["checksum"] = "none"
-                    location_key = "image.kubevim.kubenfv.io/source-url"
-                    if (
-                        img.metadata
-                        and img.metadata.fields
-                        and location_key in img.metadata.fields
-                    ):
-                        img_dict["location"] = img.metadata.fields[location_key]
-                    else:
-                        img_dict["location"] = "None"
-                    resp.append(img_dict)
-                return resp
+                images = ImageServiceApi(api_client).list_images(filter=img_filter)
             except (ApiException, urllib3.exceptions.HTTPError) as e:
                 self._format_exception(e)
+        resp = []
+        for img in images or []:
+            img_dict = convert_enums(img.model_dump(by_alias=True, exclude_none=True))
+            if img.source:
+                img_dict["source"] = img.source.to_dict()
+            img_dict["id"] = img.image_id
+            img_dict["name"] = img.name
+            img_dict["checksum"] = "none"
+            source = img.source.actual_instance if img.source else None
+            if isinstance(source, ImageSourceHttp):
+                img_dict["location"] = source.http.url
+            else:
+                img_dict["location"] = "None"
+            resp.append(img_dict)
+        return resp
 
     def new_vminstance(
         self,
@@ -714,157 +618,90 @@ class vimconnector(vimconn.VimConnector):
             flavor_id,
             net_list,
         )
-        # Interfaces are matched back to net_list by net_id, so it must be unique
-        net_ids = [net["net_id"] for net in net_list if net.get("net_id")]
-        if len(net_ids) != len(set(net_ids)):
-            raise vimconn.VimConnNotSupportedException(
-                "more than one interface on the same network is not supported"
-            )
-        req = PbAllocateComputeRequest(
-            computeFlavourId=Identifier(value=flavor_id),
-            computeName=name,
-            vcImageId=Identifier(value=image_id),
-        )
-
-        req.interface_data = []
-        req.interface_ipam = []
-        for net in net_list:
-            nic_type = None
+        interfaces = []
+        for idx, net in enumerate(net_list):
             if net["type"] == "virtual":
                 nic_type = TypeVirtualNic.TYPE_VIRTUAL_NIC_BRIDGE
             elif net["type"] in ("PCI-PASSTHROUGH", "PCI_PASSTHROUGH", "PF"):
                 raise vimconn.VimConnNotSupportedException(
                     f'PCI passthrough interface ({net["type"]}) is not supported by Kube-VIM'
                 )
-            # TODO: Differentiate shared and not shared VF's
-            elif (
-                net["type"] == "SR-IOV"
-                or net["type"] == "VF"
-                or net["type"] == "VFnotShared"
-            ):
+            elif net["type"] in ("SR-IOV", "VF", "VFnotShared"):
                 nic_type = TypeVirtualNic.TYPE_VIRTUAL_NIC_SRIOV
             else:
                 raise vimconn.VimConnNotSupportedException(
                     f'unknown network type: {net["type"]}'
                 )
+            if not net.get("net_id"):
+                raise vimconn.VimConnNotSupportedException(
+                    "an interface without a network is not supported by Kube-VIM"
+                )
+            # The interface name is its VIM id: unique in the VM, and returned by Kube-VIM.
+            iface = NetworkInterfaceData(
+                name=f"nic{idx}", networkId=net["net_id"], typeVirtualNic=nic_type
+            )
+            if nic_type == TypeVirtualNic.TYPE_VIRTUAL_NIC_SRIOV:
+                # Kube-VIM assigns no addresses to SR-IOV interfaces; the guest does.
+                iface.ip_assignment = IpAssignment.IP_ASSIGNMENT_NONE
+            elif net.get("ip_address"):
+                iface.ip_assignment = IpAssignment.IP_ASSIGNMENT_STATIC
+                iface.ip_addresses = [net["ip_address"]]
+            if net.get("mac_address"):
+                iface.mac_address = net["mac_address"]
+            interfaces.append(iface)
 
-            net_data = VirtualNetworkInterfaceData(typeVirtualNic=nic_type)
-
-            if "bw" in net:
-                net_data.bandwidth = int(net["bw"]) * 1000
-            if "net_id" in net:
-                net_data.network_id = Identifier(value=net["net_id"])
-
-            net_ipam = VirtualNetworkInterfaceIPAM(networkId=net_data.network_id)
-            if "ip_address" in net:
-                net_ipam.ip_address = IPAddress(ip=net["ip_address"])
-            if "mac_address" in net:
-                net_ipam.mac_address = MacAddress(mac=net["mac_address"])
-
-            if "ip_address" not in net:
-                net_meta = Metadata()
-                net_meta.fields = {
-                    "compute.kubevim.kubenfv.io/network.subnet.assignment": "random",
-                }
-                net_data.metadata = net_meta
-
-            req.interface_data.append(net_data)
-            req.interface_ipam.append(net_ipam)
-
+        req = CreateComputeRequest(
+            compute=Compute(computeName=name, flavourId=flavor_id, imageId=image_id),
+            networkInterfaces=interfaces,
+        )
+        if start is False:
+            req.start = False
         _, userdata = self._create_user_data(cloud_config)
         if userdata:
             req.user_data = UserData(
                 content=str(userdata),
-                method=UserDataUserDataTransportationMethod.NO_CLOUD,
+                method=UserDataTransportationMethod.USER_DATA_TRANSPORTATION_METHOD_NO_CLOUD,
             )
         with self._api_client() as api_client:
-            api_instance = vi_vnfm_api.ViVnfmApi(api_client)
             try:
-                vm_data = api_instance.vi_vnfm_allocate_virtualised_compute_resource(
-                    body=req
-                )
-                vm_id = vm_data.compute_data.compute_id.value
-                for iface in vm_data.compute_data.virtual_network_interface:
-                    ifaceMeta = iface.metadata
-                    if ifaceMeta is None or ifaceMeta.fields is None:
-                        continue
-                    # Skip the KubeVirt-managed PodNetwork interface (ovn-default,
-                    # tagged with network.vm.kubevirt.io/management=true by kube-vim).
-                    # All Multus-attached interfaces (no such label) must be processed
-                    # so their vim_id gets recorded; otherwise ns_thread raises KeyError
-                    # on net_list iface["vim_id"] and the whole VDU CREATE task is
-                    # marked FAILED even though kube-vim already created the VM.
-                    mgmtIfaceLabel = "network.vm.kubevirt.io/management"
-                    if (
-                        mgmtIfaceLabel in ifaceMeta.fields
-                        and ifaceMeta.fields[mgmtIfaceLabel] == "true"
-                    ):
-                        continue
-                    if iface.network_id is None:
-                        continue
-                    # Try to find iface with same networkid
-                    ifaceNet = iface.network_id.value
-
-                    for cfgIface in net_list:
-                        if cfgIface["net_id"] == ifaceNet:
-                            # Update vim_id from response
-                            cfgIface["vim_id"] = iface.resource_id.value
-                            self.logger.debug(
-                                "Update iface vim_id: %s for network %s",
-                                cfgIface["vim_id"],
-                                ifaceNet,
-                            )
-                return vm_id, {}
+                vm = ComputeServiceApi(api_client).create_compute(req)
             except (ApiException, urllib3.exceptions.HTTPError) as ex:
                 self._format_exception(ex)
+        created = {iface.name for iface in vm.network_interfaces or []}
+        for net, iface in zip(net_list, interfaces):
+            if iface.name in created:
+                net["vim_id"] = iface.name
+        return vm.compute_id, {}
 
     def get_vminstance(self, vm_id):
         self.logger.debug("Compute %s get request", vm_id)
         with self._api_client() as api_client:
-            api_instance = vi_vnfm_api.ViVnfmApi(api_client)
-            query_filter = f"filter=(eq,computeId/value,{vm_id})"
             try:
-                api_response = api_instance.vi_vnfm_query_virtualised_compute_resource(
-                    query_compute_filter_value=query_filter
-                )
-                # query_result can be None when no VMs match the filter
-                if (
-                    api_response.query_result is None
-                    or len(api_response.query_result) == 0
-                ):
-                    raise vimconn.VimConnNotFoundException(
-                        f"not found vm with id {vm_id}"
-                    )
-                if len(api_response.query_result) > 1:
-                    raise vimconn.VimConnUnexpectedResponse(
-                        f"more than one vm was found with id {vm_id}"
-                    )
-                vm_info = api_response.query_result[0]
-                return convert_enums(vm_info.model_dump(by_alias=True))
+                vm = ComputeServiceApi(api_client).get_compute(vm_id)
+                return convert_enums(vm.model_dump(by_alias=True, exclude_none=True))
             except (ApiException, urllib3.exceptions.HTTPError) as ex:
                 self._format_exception(ex)
 
     def delete_vminstance(self, vm_id, created_items=None, volumes_to_hold=None):
-        # Currently only vm_id is enough
         self.logger.debug("Compute %s delete request", vm_id)
         with self._api_client() as api_client:
-            api_instance = vi_vnfm_api.ViVnfmApi(api_client)
             try:
-                api_response = (
-                    api_instance.vi_vnfm_terminate_virtualised_compute_resource(
-                        compute_id_value=vm_id
-                    )
-                )
-                if api_response.compute_id.value != vm_id:
-                    raise vimconn.VimConnUnexpectedResponse(
-                        f"delete vm id {api_response.compute_id.value} mismatch input id {vm_id}"
-                    )
+                ComputeServiceApi(api_client).delete_compute(vm_id)
                 return vm_id
             except (ApiException, urllib3.exceptions.HTTPError) as ex:
                 self._format_exception(ex)
 
     def refresh_vms_status(self, vm_list: List):
         res = dict()
+        status_map = {
+            ComputeRunningState.COMPUTE_RUNNING_STATE_STARTED.value: "ACTIVE",
+            ComputeRunningState.COMPUTE_RUNNING_STATE_MIGRATING.value: "ACTIVE",
+            ComputeRunningState.COMPUTE_RUNNING_STATE_PAUSED.value: "PAUSED",
+            ComputeRunningState.COMPUTE_RUNNING_STATE_STARTING.value: "BUILD",
+            ComputeRunningState.COMPUTE_RUNNING_STATE_STOPPING.value: "INACTIVE",
+            ComputeRunningState.COMPUTE_RUNNING_STATE_STOPPED.value: "INACTIVE",
+            ComputeRunningState.COMPUTE_RUNNING_STATE_TERMINATING.value: "INACTIVE",
+        }
         for vm_id in vm_list:
             try:
                 vm_info = self.get_vminstance(vm_id)
@@ -880,68 +717,47 @@ class vimconnector(vimconn.VimConnector):
                     "error_msg": str(ex),
                 }
                 continue
-            running_state = vm_info["runningState"]
-            err_msg = ""
-
-            if running_state == "FAILED":
-                metadata = vm_info["metadata"]["fields"]
-                reason_meta_label = "status.vmi.kubevirt.io/reason"
-                err_msg = "unknown"
-                if reason_meta_label in metadata:
-                    err_msg = metadata[reason_meta_label]
+            running_state = vm_info.get("runningState")
+            if running_state == ComputeRunningState.COMPUTE_RUNNING_STATE_FAILED.value:
                 res[vm_id] = {
                     "status": "ERROR",
-                    "error_msg": err_msg,
+                    "error_msg": vm_info.get("statusDetail") or "unknown",
                 }
                 continue
-
-            status_map = {
-                "RUNNING": "ACTIVE",
-                "PAUSED": "PAUSED",
-                "STARTING": "BUILD",
-                "SUSPENDED": "SUSPENDED",
-                "STOPPED": "INACTIVE",
-                "TERMINATING": "INACTIVE",
-            }
+            err_msg = ""
             vm_status = status_map.get(running_state, "OTHER")
             if vm_status == "OTHER":
                 err_msg = f"status is {running_state}"
 
-            vim_info = yaml.safe_dump(vm_info)
             interfaces = []
-            for iface in vm_info["virtualNetworkInterface"]:
-                ifaceMeta = iface["metadata"]["fields"]
-                ifaceReadyLabel = "interface.vm.kubevirt.io/ready"
+            for iface in vm_info.get("networkInterfaces") or []:
                 if (
-                    ifaceReadyLabel not in ifaceMeta
-                    or ifaceMeta[ifaceReadyLabel] == "false"
+                    iface.get("operationalState")
+                    != OperationalState.OPERATIONAL_STATE_ENABLED.value
                 ):
                     # Need to think if Active:NoMgmtIp is better suited here
                     vm_status = "BUILD"
                     continue
-                iface_dict = dict()
-                iface_dict["vim_info"] = yaml.safe_dump(iface)
-                iface_dict["mac_address"] = iface["macAddress"]["mac"]
-                if len(iface["ipAddress"]) > 0:
-                    iface_dict["ip_address"] = iface["ipAddress"][0]["ip"]
-                else:
-                    iface_dict["ip_address"] = None
-                if iface["networkId"] is not None:
-                    iface_dict["vim_net_id"] = iface["networkId"]["value"]
-                elif (
-                    iface["metadata"]["fields"]["network.vm.kubevirt.io/management"]
-                    == "true"
-                ):
+                ips = iface.get("ipAddresses") or []
+                iface_dict = {
+                    "vim_info": yaml.safe_dump(iface),
+                    "mac_address": iface.get("macAddress"),
+                    "ip_address": ips[0] if ips else None,
+                    "vim_interface_id": iface.get("name"),
+                    "compute_node": vm_info.get("hostId"),
+                }
+                if iface.get("networkId"):
+                    iface_dict["vim_net_id"] = iface["networkId"]
+                elif iface.get("isManagement"):
                     iface_dict["vim_net_id"] = "management"
-                iface_dict["vim_interface_id"] = iface["resourceId"]["value"]
-                iface_dict["compute_node"] = vm_info["hostId"]["value"]
-                # TODO: pci and vlan
+                if iface.get("hostPciAddress"):
+                    iface_dict["pci"] = iface["hostPciAddress"]
                 interfaces.append(iface_dict)
 
             res[vm_id] = {
                 "status": vm_status,
                 "error_msg": err_msg,
-                "vim_info": vim_info,
+                "vim_info": yaml.safe_dump(vm_info),
                 "interfaces": interfaces,
             }
         return res
@@ -1035,15 +851,29 @@ class vimconnector(vimconn.VimConnector):
             raise vimconn.VimConnUnexpectedResponse(f"{url} returned invalid JSON")
         return body
 
-    def _format_exception(self, exception: ApiException):
-        """Raises a vimconn exception if the requests to the api is not OK"""
-        if isinstance(exception, UnauthorizedException):
-            raise vimconn.VimConnAuthException(exception)
-        elif isinstance(exception, NotFoundException):
-            raise vimconn.VimConnNotFoundException(exception)
-        elif isinstance(exception, ConflictException):
-            raise vimconn.VimConnConflictException(exception)
-        elif isinstance(exception, BadRequestException):
-            raise vimconn.VimConnException(exception)
-        else:
+    def _format_exception(self, exception):
+        """Raises the vimconn exception for a failed Kube-VIM request."""
+        if not isinstance(exception, ApiException):
             raise vimconn.VimConnConnectionException(exception)
+        problem = {}
+        try:
+            problem = json.loads(exception.body or "{}")
+        except ValueError:
+            pass
+        if not isinstance(problem, dict):
+            problem = {}
+        message = f"{exception.status} {problem.get('detail') or exception.reason}"
+        if isinstance(exception, (UnauthorizedException, ForbiddenException)):
+            raise vimconn.VimConnAuthException(message)
+        elif isinstance(exception, NotFoundException):
+            raise vimconn.VimConnNotFoundException(message)
+        elif isinstance(exception, ConflictException):
+            raise vimconn.VimConnConflictException(message)
+        elif (
+            exception.status == 501 or problem.get("type") == UNSUPPORTED_FIELD_PROBLEM
+        ):
+            raise vimconn.VimConnNotSupportedException(message)
+        elif exception.status in (400, 422):
+            raise vimconn.VimConnException(message)
+        else:
+            raise vimconn.VimConnConnectionException(message)
