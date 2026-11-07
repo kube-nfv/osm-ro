@@ -32,5 +32,6 @@
 -r RO-VIM-openvim/requirements.in
 -r RO-VIM-vmware/requirements.in
 -r RO-VIM-gcp/requirements.in
+-r RO-VIM-kubevim/requirements.in
 
 pyyaml>6
